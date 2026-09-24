@@ -1,5 +1,7 @@
 # Relay protocol
 
+For a self-contained repository user guide, see [LLM_WIKI.md](./LLM_WIKI.md).
+
 NDJSON, one JSON object per line. The server accepts plain TCP only on a
 numeric loopback bind address. Any other bind requires a TLS certificate and
 private key (`CHAT_RELAY_TLS_CERT`, `CHAT_RELAY_TLS_KEY`); peers must verify
