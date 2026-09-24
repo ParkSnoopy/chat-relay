@@ -1,34 +1,52 @@
-"""Smoke test for chat-relay: needs a running server on 127.0.0.1:9000.
+"""Smoke test for a running relay with matching CHAT_RELAY_AUTH_TOKEN.
 
-    cargo run -- 127.0.0.1:9000 &
-    python3 tests/relay_smoke.py
+Set TEST_RELAY_PORT and TEST_RELAY_TLS_CERT for a TLS listener.
 """
-import json, socket, threading, time, base64
+import json, select, socket, ssl, threading, time, os
 
-ADDR = ("127.0.0.1", 9000)
+ADDR = ("127.0.0.1", int(os.environ.get("TEST_RELAY_PORT", "9000")))
+SERVER_TOKEN = os.environ["CHAT_RELAY_AUTH_TOKEN"]
+TLS_CERT = os.environ.get("TEST_RELAY_TLS_CERT")
 
 class Client:
     def __init__(self):
         self.sock = socket.create_connection(ADDR, timeout=5)
-        self.f = self.sock.makefile("rb")
+        if TLS_CERT:
+            self.sock = ssl.create_default_context(cafile=TLS_CERT).wrap_socket(self.sock, server_hostname="localhost")
+        self.sock.settimeout(0.25 if TLS_CERT else None)
         self.inbox = []
         self.lock = threading.Lock()
+        self.io_lock = threading.Lock()
         self.alive = True
         self.t = threading.Thread(target=self._read, daemon=True)
         self.t.start()
 
     def _read(self):
+        buffer = b""
         try:
-            for line in self.f:
-                msg = json.loads(line)
-                with self.lock:
-                    self.inbox.append(msg)
-        except Exception:
+            while True:
+                if isinstance(self.sock, ssl.SSLSocket):
+                    if not self.sock.pending() and not select.select([self.sock], [], [], 0.05)[0]:
+                        continue
+                    try:
+                        with self.io_lock:
+                            data = self.sock.recv(65536)
+                    except socket.timeout:
+                        continue
+                else:
+                    data = self.sock.recv(65536)
+                if not data:
+                    break
+                buffer += data
+                while b"\n" in buffer:
+                    line, buffer = buffer.split(b"\n", 1)
+                    with self.lock:
+                        self.inbox.append(json.loads(line))
+        except (OSError, ValueError):
             pass
         self.alive = False
 
     def close(self):
-        # makefile holds the fd; shutdown() is what actually sends FIN.
         try:
             self.sock.shutdown(socket.SHUT_RDWR)
         except OSError:
@@ -42,13 +60,20 @@ class Client:
                 data += b"\n"
         else:
             data = (json.dumps(obj) + "\n").encode()
-        self.sock.sendall(data)
+        with self.io_lock:
+            self.sock.sendall(data)
 
-    def wait_for(self, pred, timeout=2.0):
+    def register(self, name, token=None):
+        msg = {"type": "register", "name": name, "server_token": SERVER_TOKEN}
+        if token is not None:
+            msg["token"] = token
+        self.send(msg)
+
+    def wait_for(self, pred, timeout=2.0, since=0):
         end = time.time() + timeout
         while time.time() < end:
             with self.lock:
-                for m in self.inbox:
+                for m in self.inbox[since:]:
                     if pred(m):
                         return m
             time.sleep(0.05)
@@ -60,11 +85,11 @@ def check(label, cond):
 
 # 1. alice registers first (deterministic order), then bob
 alice = Client(); bob = Client()
-alice.send({"type": "register", "name": "alice"})
+alice.register("alice")
 wa = alice.wait_for(lambda m: m.get("type") == "welcome" and m.get("user") == "alice")
 check("welcome with token (alice)", wa and wa.get("token"))
 alice_token = wa["token"]
-bob.send({"type": "register", "name": "bob"})
+bob.register("bob")
 wb = bob.wait_for(lambda m: m.get("type") == "welcome" and m.get("user") == "bob")
 check("welcome with token (bob)", wb and wb.get("token"))
 bob_token = wb["token"]
@@ -80,53 +105,88 @@ check("users before register rejected", anon.wait_for(lambda m: m.get("error") =
 
 # 2. duplicate name rejected
 eve = Client()
-eve.send({"type": "register", "name": "alice"})
+eve.register("alice")
 check("dup name rejected", eve.wait_for(lambda m: m.get("type") == "error" and m.get("error") == "name taken"))
+
+unauthorized = Client()
+unauthorized.send({"type": "register", "name": "mallory", "server_token": "wrong"})
+check("server admission required", unauthorized.wait_for(lambda m: m.get("error") == "unauthorized"))
+invalid = Client()
+invalid.register("fake\nlog")
+check("unsafe name rejected", invalid.wait_for(lambda m: m.get("error") == "invalid name"))
 
 # 3. msg before register rejected
 anon = Client()
 anon.send({"type": "msg", "payload": "x"})
 check("msg before register rejected", anon.wait_for(lambda m: m.get("error") == "register first"))
 
-# 4. fan-out: msg from alice reaches alice, bob, eve(not registered) not
-payload = base64.b64encode(b"\xde\xad\xbe\xef-\xec\x95\x88\xeb\x85\x95").decode()
-alice.send({"type": "msg", "payload": payload, "kind": "file"})
-check("sender gets own msg", alice.wait_for(lambda m: m.get("from") == "alice" and m.get("payload") == payload and m.get("kind") == "file"))
+# 4. fan-out: payload structure belongs to the sender, not the relay
+payload = {"opaque": [1, {"nested": True}]}
+alice.send({"type": "msg", "payload": payload, "broadcast": True})
+check("sender gets own msg", alice.wait_for(lambda m: m.get("from") == "alice" and m.get("payload") == payload))
 check("bob gets msg", bob.wait_for(lambda m: m.get("from") == "alice" and m.get("payload") == payload))
 check("unregistered peer gets nothing", eve.wait_for(lambda m: m.get("type") == "msg", timeout=0.5) is None)
 
-# 5. disconnect and reclaim name via token
-bob.close()
-check("existing user sees left", alice.wait_for(lambda m: m.get("type") == "left" and m.get("user") == "bob"))
-time.sleep(0.3)
+carol = Client()
+carol.register("carol")
+check("third member registered", carol.wait_for(lambda m: m.get("type") == "welcome"))
+direct_payload = {"opaque": [2, {"different": False}]}
+alice.send({"type": "msg", "payload": direct_payload, "to": "bob"})
+check("direct recipient gets message", bob.wait_for(lambda m: m.get("payload") == direct_payload and m.get("from") == "alice"))
+check("non-recipient gets no direct message", carol.wait_for(lambda m: m.get("payload") == direct_payload, timeout=0.5) is None)
+alice.send({"type": "msg", "payload": payload})
+check("no implicit broadcast", alice.wait_for(lambda m: m.get("error") == "invalid message"))
+with alice.lock:
+    previous = len(alice.inbox)
+alice.send({"type": "msg", "payload": payload, "broadcast": True, "extension": "outside-envelope"})
+check("non-routing field rejected", alice.wait_for(lambda m: m.get("error") == "invalid message", since=previous))
+alice.send({"type": "ping"})
+check("registered keepalive", alice.wait_for(lambda m: m.get("type") == "pong"))
+
+# 5. reclaim an active name via token; old socket loses authority
 bob2 = Client()
-bob2.send({"type": "register", "name": "bob", "token": bob_token})
-wb2 = bob2.wait_for(lambda m: m.get("type") == "welcome" and m.get("user") == "bob" and m.get("token") == bob_token)
-check("token reclaim", wb2 is not None)
+bob2.register("bob", bob_token)
+wb2 = bob2.wait_for(lambda m: m.get("type") == "welcome" and m.get("user") == "bob")
+check("token reclaim rotates token", wb2 is not None and wb2.get("token") != bob_token)
+bob.t.join(timeout=3)
+check("old socket closed", not bob.alive)
+bob.close()
 
 # 6. reclaim with wrong token fails while name free? name is now occupied by bob2 -> rejected
 bob3 = Client()
-bob3.send({"type": "register", "name": "bob", "token": "deadbeef"})
+bob3.register("bob", bob_token)
 check("wrong token + taken name rejected", bob3.wait_for(lambda m: m.get("error") == "name taken"))
 
 # 7. garbage json -> error, connection survives
 anon.send(b"not json\n")
 check("bad json error", anon.wait_for(lambda m: m.get("error") == "bad json"))
+if not TLS_CERT:
+    oversized = Client()
+    try:
+        oversized.send(b"x" * (256 * 1024 + 1))
+    except OSError:
+        pass
+    oversized.t.join(timeout=3)
+    check("oversized line closes socket", not oversized.alive)
 
-# 8. alice disconnects, name freed, plain re-register works
+# 8. alice disconnects; name remains reserved until token expiry
 alice.close()
-def wait_name_free():
-    end = time.time() + 3.0
-    while time.time() < end:
-        c = Client()
-        c.send({"type": "register", "name": "alice"})
-        m = c.wait_for(lambda m: m.get("type") in ("welcome", "error"))
-        if m and m.get("type") == "welcome":
-            return c
-        c.close()
-        time.sleep(0.2)
-    return None
-alice2 = wait_name_free()
-check("name freed after disconnect", alice2 is not None)
+check("disconnect announced", carol.wait_for(lambda m: m.get("type") == "left" and m.get("user") == "alice"))
+impostor = Client()
+impostor.register("alice")
+check("disconnected name reserved", impostor.wait_for(lambda m: m.get("error") == "name taken"))
+alice2 = Client()
+alice2.register("alice", alice_token)
+check("owner reclaims disconnected name", alice2.wait_for(lambda m: m.get("type") == "welcome" and m.get("user") == "alice"))
+stale = Client()
+stale.register("alice", alice_token)
+check("old token revoked on new claim", stale.wait_for(lambda m: m.get("error") == "name taken"))
+
+race = [Client(), Client()]
+threads = [threading.Thread(target=c.register, args=("race",)) for c in race]
+for thread in threads: thread.start()
+for thread in threads: thread.join()
+results = [c.wait_for(lambda m: m.get("type") in ("welcome", "error")) for c in race]
+check("concurrent claims have one winner", all(m is not None for m in results) and sorted(m["type"] for m in results if m is not None) == ["error", "welcome"])
 
 print("ALL PASS")
