@@ -9,3 +9,4 @@ serde_json = "1"
 rand = "0.8"
 tokio-stream = "0.1"
 tokio-util = { version = "0.7", features = ["codec"] }
+dotenvy = "0.15"

@@ -180,10 +180,13 @@ async fn handle(sock: TcpStream, state: Arc<State>) {
 
 #[tokio::main]
 async fn main() {
+    if std::fs::exists(".env").expect("inspect .env") {
+        dotenvy::from_filename(".env").expect("load .env");
+    }
     let addr = std::env::args()
         .nth(1)
         .or_else(|| std::env::var("CHAT_RELAY_ADDR").ok())
-        .unwrap_or_else(|| "0.0.0.0:9000".to_string());
+        .unwrap_or_else(|| "127.0.0.1:9000".to_string());
     let listener = TcpListener::bind(&addr).await.expect("bind");
     println!("chat-relay listening on {addr}");
     let state = Arc::new(State::default());
