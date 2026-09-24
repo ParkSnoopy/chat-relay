@@ -3,22 +3,53 @@
 //! NDJSON over TCP on loopback, TLS elsewhere. Route payloads without
 //! interpreting their application-level format.
 
-use std::collections::HashMap;
-use std::fs::File;
-use std::io::{self, BufReader};
-use std::net::SocketAddr;
-use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
+use std::{
+    collections::HashMap,
+    fs::File,
+    io::{
+        self,
+        BufReader,
+    },
+    net::SocketAddr,
+    sync::{
+        Arc,
+        Mutex,
+    },
+    time::{
+        Duration,
+        Instant,
+    },
+};
 
-use serde_json::{Value, json};
+use serde_json::{
+    Value,
+    json,
+};
 use subtle::ConstantTimeEq;
-use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt, BufWriter};
-use tokio::net::TcpListener;
-use tokio::sync::{Semaphore, mpsc, watch};
-use tokio::time::timeout;
-use tokio_rustls::{TlsAcceptor, rustls};
+use tokio::{
+    io::{
+        AsyncRead,
+        AsyncWrite,
+        AsyncWriteExt,
+        BufWriter,
+    },
+    net::TcpListener,
+    sync::{
+        Semaphore,
+        mpsc,
+        watch,
+    },
+    time::timeout,
+};
+use tokio_rustls::{
+    TlsAcceptor,
+    rustls,
+};
 use tokio_stream::StreamExt;
-use tokio_util::codec::{FramedRead, LinesCodec};
+use tokio_util::codec::{
+    FramedRead,
+    LinesCodec,
+};
 
 // Bound frame size and queued memory per connection.
 const MAX_LINE: usize = 256 * 1024;
@@ -57,7 +88,9 @@ fn token() -> String {
 fn valid_name(name: &str) -> bool {
     !name.is_empty()
         && name.len() <= 32
-        && name.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
+        && name
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
 }
 
 fn deliver(session: &Session, line: Arc<String>) {
@@ -88,11 +121,15 @@ where
 
     let mut writer_task = tokio::spawn(async move {
         while let Some(line) = rx.recv().await {
-            if !matches!(timeout(WRITE_TIMEOUT, async {
+            if !matches!(
+                timeout(WRITE_TIMEOUT, async {
                     writer.write_all(line.as_bytes()).await?;
                     writer.write_all(b"\n").await?;
                     writer.flush().await
-                }).await, Ok(Ok(()))) {
+                })
+                .await,
+                Ok(Ok(()))
+            ) {
                 break;
             }
         }
@@ -132,21 +169,33 @@ where
                     }
                     continue;
                 }
-                if !msg.get("server_token").and_then(Value::as_str).is_some_and(|t| {
-                    t.as_bytes().ct_eq(state.auth_token.as_bytes()).into()
-                }) {
+                if !msg
+                    .get("server_token")
+                    .and_then(Value::as_str)
+                    .is_some_and(|t| t.as_bytes().ct_eq(state.auth_token.as_bytes()).into())
+                {
                     let _ = reply(&tx, json!({"type": "error", "error": "unauthorized"}));
                     break;
                 }
-                if !msg.as_object().is_some_and(|fields| fields.keys().all(|key| {
-                    matches!(key.as_str(), "type" | "name" | "token" | "server_token")
-                })) || msg.get("token").is_some_and(|v| !v.is_string()) {
-                    if !reply(&tx, json!({"type": "error", "error": "invalid registration"})) {
+                if !msg.as_object().is_some_and(|fields| {
+                    fields.keys().all(|key| {
+                        matches!(key.as_str(), "type" | "name" | "token" | "server_token")
+                    })
+                }) || msg.get("token").is_some_and(|v| !v.is_string())
+                {
+                    if !reply(
+                        &tx,
+                        json!({"type": "error", "error": "invalid registration"}),
+                    ) {
                         break;
                     }
                     continue;
                 }
-                let Some(req_name) = msg.get("name").and_then(Value::as_str).filter(|s| valid_name(s)) else {
+                let Some(req_name) = msg
+                    .get("name")
+                    .and_then(Value::as_str)
+                    .filter(|s| valid_name(s))
+                else {
                     if !reply(&tx, json!({"type": "error", "error": "invalid name"})) {
                         break;
                     }
@@ -156,31 +205,59 @@ where
                 let req_token = msg.get("token").and_then(Value::as_str);
                 let outcome = {
                     let mut registry = state.registry.lock().unwrap();
-                    registry.tokens.retain(|_, record| record.expires.is_none_or(|until| until > Instant::now()));
-                    let valid = req_token.is_some_and(|t| registry.tokens.get(&req_name).is_some_and(|record| {
-                        record.value.as_bytes().ct_eq(t.as_bytes()).into()
-                    }));
+                    registry.tokens.retain(|_, record| {
+                        record.expires.is_none_or(|until| until > Instant::now())
+                    });
+                    let valid = req_token.is_some_and(|t| {
+                        registry.tokens.get(&req_name).is_some_and(|record| {
+                            record.value.as_bytes().ct_eq(t.as_bytes()).into()
+                        })
+                    });
                     if registry.tokens.contains_key(&req_name) && !valid {
                         None
                     } else {
-                        if !registry.tokens.contains_key(&req_name) && registry.tokens.len() == MAX_TOKENS {
+                        if !registry.tokens.contains_key(&req_name)
+                            && registry.tokens.len() == MAX_TOKENS
+                        {
                             // ponytail: bounded linear eviction; index only if token churn matters.
-                            if let Some(oldest) = registry.tokens.iter()
-                                .filter_map(|(name, record)| record.expires.map(|until| (name.clone(), until)))
-                                .min_by_key(|(_, until)| *until).map(|(name, _)| name) {
+                            if let Some(oldest) = registry
+                                .tokens
+                                .iter()
+                                .filter_map(|(name, record)| {
+                                    record.expires.map(|until| (name.clone(), until))
+                                })
+                                .min_by_key(|(_, until)| *until)
+                                .map(|(name, _)| name)
+                            {
                                 registry.tokens.remove(&oldest);
                             }
                         }
                         let tok = token();
-                        registry.tokens.insert(req_name.clone(), TokenRecord { value: tok.clone(), expires: None });
-                        if let Some(old) = registry.users.insert(req_name.clone(), Session {
-                            tx: tx.clone(), shutdown: shutdown_tx.clone(),
-                        }) {
+                        registry.tokens.insert(
+                            req_name.clone(),
+                            TokenRecord {
+                                value: tok.clone(),
+                                expires: None,
+                            },
+                        );
+                        if let Some(old) = registry.users.insert(
+                            req_name.clone(),
+                            Session {
+                                tx: tx.clone(),
+                                shutdown: shutdown_tx.clone(),
+                            },
+                        ) {
                             let _ = old.shutdown.send(true);
                         }
-                        let queued = reply(&tx, json!({"type": "welcome", "user": req_name, "token": tok}));
+                        let queued = reply(
+                            &tx,
+                            json!({"type": "welcome", "user": req_name, "token": tok}),
+                        );
                         if queued {
-                            broadcast(&registry, Arc::new(json!({"type": "joined", "user": req_name}).to_string()));
+                            broadcast(
+                                &registry,
+                                Arc::new(json!({"type": "joined", "user": req_name}).to_string()),
+                            );
                         }
                         Some(queued)
                     }
@@ -206,12 +283,15 @@ where
                 };
                 let to = msg.get("to").and_then(Value::as_str);
                 let all = msg.get("broadcast") == Some(&Value::Bool(true));
-                let valid = msg.as_object().is_some_and(|fields| fields.keys().all(|key| {
-                    matches!(key.as_str(), "type" | "payload" | "to" | "broadcast")
-                }) && fields.contains_key("payload"))
-                    && msg.get("broadcast").is_none_or(Value::is_boolean)
+                let valid = msg.as_object().is_some_and(|fields| {
+                    fields
+                        .keys()
+                        .all(|key| matches!(key.as_str(), "type" | "payload" | "to" | "broadcast"))
+                        && fields.contains_key("payload")
+                }) && msg.get("broadcast").is_none_or(Value::is_boolean)
                     && msg.get("to").is_none_or(Value::is_string)
-                    && (all != to.is_some()) && to.is_none_or(valid_name);
+                    && (all != to.is_some())
+                    && to.is_none_or(valid_name);
                 if !valid {
                     if !reply(&tx, json!({"type": "error", "error": "invalid message"})) {
                         break;
@@ -223,7 +303,11 @@ where
                 let line = Arc::new(out.to_string());
                 let result = {
                     let registry = state.registry.lock().unwrap();
-                    if !registry.users.get(from).is_some_and(|session| session.tx.same_channel(&tx)) {
+                    if !registry
+                        .users
+                        .get(from)
+                        .is_some_and(|session| session.tx.same_channel(&tx))
+                    {
                         Some("register first")
                     } else if to.is_some_and(|to| !registry.users.contains_key(to)) {
                         Some("user unavailable")
@@ -262,8 +346,12 @@ where
                     continue;
                 }
                 let registry = state.registry.lock().unwrap();
-                let active = name.as_deref().is_some_and(|name| registry.users.get(name)
-                    .is_some_and(|session| session.tx.same_channel(&tx)));
+                let active = name.as_deref().is_some_and(|name| {
+                    registry
+                        .users
+                        .get(name)
+                        .is_some_and(|session| session.tx.same_channel(&tx))
+                });
                 if !active {
                     break;
                 }
@@ -280,8 +368,12 @@ where
                     continue;
                 }
                 let registry = state.registry.lock().unwrap();
-                if !registry.users.get(name.as_deref().unwrap()).is_some_and(|session| session.tx.same_channel(&tx))
-                    || !reply(&tx, json!({"type": "pong"})) {
+                if !registry
+                    .users
+                    .get(name.as_deref().unwrap())
+                    .is_some_and(|session| session.tx.same_channel(&tx))
+                    || !reply(&tx, json!({"type": "pong"}))
+                {
                     break;
                 }
             }
@@ -295,13 +387,19 @@ where
 
     if let Some(name) = name.take() {
         let mut registry = state.registry.lock().unwrap();
-        let owned = registry.users.get(&name).is_some_and(|session| session.tx.same_channel(&tx));
+        let owned = registry
+            .users
+            .get(&name)
+            .is_some_and(|session| session.tx.same_channel(&tx));
         if owned {
             registry.users.remove(&name);
             if let Some(record) = registry.tokens.get_mut(&name) {
                 record.expires = Some(Instant::now() + TOKEN_TTL);
             }
-            broadcast(&registry, Arc::new(json!({"type": "left", "user": name}).to_string()));
+            broadcast(
+                &registry,
+                Arc::new(json!({"type": "left", "user": name}).to_string()),
+            );
             println!("{peer} disconnected: {name}");
         }
     }
@@ -332,22 +430,37 @@ async fn main() {
     if std::fs::exists(".env").expect("inspect .env") {
         dotenvy::from_filename(".env").unwrap_or_else(|_| panic!("invalid .env"));
     }
-    let auth_token = std::env::var("CHAT_RELAY_AUTH_TOKEN").expect("CHAT_RELAY_AUTH_TOKEN required");
-    assert!(auth_token.len() == 64 && auth_token.bytes().all(|b| b.is_ascii_hexdigit()),
-        "CHAT_RELAY_AUTH_TOKEN must be 64 hexadecimal characters");
+    let auth_token =
+        std::env::var("CHAT_RELAY_AUTH_TOKEN").expect("CHAT_RELAY_AUTH_TOKEN required");
+    assert!(
+        auth_token.len() == 64 && auth_token.bytes().all(|b| b.is_ascii_hexdigit()),
+        "CHAT_RELAY_AUTH_TOKEN must be 64 hexadecimal characters"
+    );
     let addr = std::env::args()
         .nth(1)
         .or_else(|| std::env::var("CHAT_RELAY_ADDR").ok())
         .unwrap_or_else(|| "127.0.0.1:6697".to_string());
     let addr: SocketAddr = addr.parse().expect("CHAT_RELAY_ADDR must be IP:port");
-    let tls = match (std::env::var("CHAT_RELAY_TLS_CERT"), std::env::var("CHAT_RELAY_TLS_KEY")) {
-        (Ok(cert), Ok(key)) => Some(tls_acceptor(&cert, &key).expect("load TLS certificate and key")),
-        (Err(std::env::VarError::NotPresent), Err(std::env::VarError::NotPresent)) if addr.ip().is_loopback() => None,
+    let tls = match (
+        std::env::var("CHAT_RELAY_TLS_CERT"),
+        std::env::var("CHAT_RELAY_TLS_KEY"),
+    ) {
+        (Ok(cert), Ok(key)) => {
+            Some(tls_acceptor(&cert, &key).expect("load TLS certificate and key"))
+        }
+        (Err(std::env::VarError::NotPresent), Err(std::env::VarError::NotPresent))
+            if addr.ip().is_loopback() =>
+        {
+            None
+        }
         _ => panic!("TLS certificate and key required for non-loopback bind"),
     };
     let listener = TcpListener::bind(addr).await.expect("bind");
     println!("chat-relay listening on {addr}");
-    let state = Arc::new(State { registry: Mutex::new(Registry::default()), auth_token });
+    let state = Arc::new(State {
+        registry: Mutex::new(Registry::default()),
+        auth_token,
+    });
     let slots = Arc::new(Semaphore::new(MAX_CONNECTIONS));
     loop {
         let (sock, peer) = listener.accept().await.expect("accept");
@@ -381,8 +494,20 @@ mod tests {
         let (fast_shutdown, _fast_closed) = watch::channel(false);
         let registry = Registry {
             users: HashMap::from([
-                ("slow".into(), Session { tx: slow_tx, shutdown: slow_shutdown }),
-                ("fast".into(), Session { tx: fast_tx, shutdown: fast_shutdown }),
+                (
+                    "slow".into(),
+                    Session {
+                        tx: slow_tx,
+                        shutdown: slow_shutdown,
+                    },
+                ),
+                (
+                    "fast".into(),
+                    Session {
+                        tx: fast_tx,
+                        shutdown: fast_shutdown,
+                    },
+                ),
             ]),
             tokens: HashMap::new(),
         };
