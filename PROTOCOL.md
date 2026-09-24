@@ -1,5 +1,7 @@
 # Relay protocol
 
+This is an IRC-like TCP relay, not the IRC wire protocol.
+
 For a self-contained repository user guide, see [LLM_WIKI.md](./LLM_WIKI.md).
 
 NDJSON, one JSON object per line. The server accepts plain TCP only on a

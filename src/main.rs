@@ -338,7 +338,7 @@ async fn main() {
     let addr = std::env::args()
         .nth(1)
         .or_else(|| std::env::var("CHAT_RELAY_ADDR").ok())
-        .unwrap_or_else(|| "127.0.0.1:9000".to_string());
+        .unwrap_or_else(|| "127.0.0.1:6697".to_string());
     let addr: SocketAddr = addr.parse().expect("CHAT_RELAY_ADDR must be IP:port");
     let tls = match (std::env::var("CHAT_RELAY_TLS_CERT"), std::env::var("CHAT_RELAY_TLS_KEY")) {
         (Ok(cert), Ok(key)) => Some(tls_acceptor(&cert, &key).expect("load TLS certificate and key")),

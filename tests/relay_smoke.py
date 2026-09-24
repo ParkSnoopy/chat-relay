@@ -4,7 +4,7 @@ Set TEST_RELAY_PORT and TEST_RELAY_TLS_CERT for a TLS listener.
 """
 import json, select, socket, ssl, threading, time, os
 
-ADDR = ("127.0.0.1", int(os.environ.get("TEST_RELAY_PORT", "9000")))
+ADDR = ("127.0.0.1", int(os.environ.get("TEST_RELAY_PORT", "6697")))
 SERVER_TOKEN = os.environ["CHAT_RELAY_AUTH_TOKEN"]
 TLS_CERT = os.environ.get("TEST_RELAY_TLS_CERT")
 

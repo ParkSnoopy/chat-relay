@@ -1,10 +1,10 @@
 # chat-relay: standalone guide for repository users
 
-This repository builds one Rust TCP relay. Each connection registers a name;
-registered peers can address another live name or explicitly broadcast to all
-live names on that server. Messages are newline-delimited JSON (NDJSON). The
-relay handles admission, routing, and connection limits. The `payload` is an
-arbitrary JSON value: the relay forwards it without assigning it meaning.
+This repository builds an IRC-like Rust TCP relay, not an IRC-protocol server.
+Each connection registers a name; registered peers can address another live
+name or explicitly broadcast to all live names on that server. Messages are
+newline-delimited JSON (NDJSON). The relay handles admission, routing, and
+connection limits. `payload` is arbitrary JSON, forwarded without meaning.
 There is no account database, message history, or application-specific payload
 format. This document is sufficient to run the relay and implement a peer;
 the linked files at the end are optional references.
@@ -17,11 +17,11 @@ hexadecimal** server admission secret before starting. The server refuses to
 start without it. On the local machine:
 
 ```sh
-cargo run --locked -- 127.0.0.1:9000
+cargo run --locked -- 127.0.0.1:6697
 ```
 
 The command-line address takes precedence over `CHAT_RELAY_ADDR`; otherwise
-the default is `127.0.0.1:9000`. Addresses must be numeric IP:port values,
+the default is `127.0.0.1:6697`. Addresses must be numeric IP:port values,
 not hostnames. The server optionally loads `.env` from its working directory;
 pre-existing process environment variables take precedence. The example
 configuration is [`.env.example`](./.env.example), with its admission secret
@@ -47,10 +47,10 @@ trusted by the test; it connects to `127.0.0.1` and verifies `localhost`.
 The [Dockerfile](./Dockerfile) builds `linux/amd64` in the publication workflow
 and starts the binary as UID/GID 65532. Build locally with
 `docker build -t chat-relay:local .`. In a container, set
-`CHAT_RELAY_ADDR=0.0.0.0:9000` (loopback inside the container is unreachable
+`CHAT_RELAY_ADDR=0.0.0.0:6697` (loopback inside the container is unreachable
 through a published port), provide the admission token and both TLS file paths
 as environment variables, mount those certificate files readably for UID
-65532, and publish TCP port 9000. TLS is mandatory on this container bind.
+65532, and publish TCP port 6697. TLS is mandatory on this container bind.
 The [publication workflow](./.github/workflows/publish-container.yml) pushes
 `ghcr.io/<lowercase-owner>/<lowercase-repo>` for pushed `v*` SemVer tags,
 with version and major.minor tags; it does not publish `latest`.
