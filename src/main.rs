@@ -4,7 +4,10 @@
 //! interpreting their application-level format.
 
 use std::{
-    collections::HashMap,
+    collections::{
+        HashMap,
+        HashSet,
+    },
     fs::File,
     io::{
         self,
@@ -281,7 +284,7 @@ where
                     }
                     continue;
                 };
-                let to = msg.get("to").and_then(Value::as_str);
+                let to = msg.get("to").and_then(Value::as_array);
                 let all = msg.get("broadcast") == Some(&Value::Bool(true));
                 let valid = msg.as_object().is_some_and(|fields| {
                     fields
@@ -289,9 +292,15 @@ where
                         .all(|key| matches!(key.as_str(), "type" | "payload" | "to" | "broadcast"))
                         && fields.contains_key("payload")
                 }) && msg.get("broadcast").is_none_or(Value::is_boolean)
-                    && msg.get("to").is_none_or(Value::is_string)
+                    && msg.get("to").is_none_or(Value::is_array)
                     && (all != to.is_some())
-                    && to.is_none_or(valid_name);
+                    && to.is_none_or(|names| {
+                        !names.is_empty()
+                            && names.len() <= MAX_CONNECTIONS
+                            && names
+                                .iter()
+                                .all(|name| name.as_str().is_some_and(valid_name))
+                    });
                 if !valid {
                     if !reply(&tx, json!({"type": "error", "error": "invalid message"})) {
                         break;
@@ -309,15 +318,22 @@ where
                         .is_some_and(|session| session.tx.same_channel(&tx))
                     {
                         Some("register first")
-                    } else if to.is_some_and(|to| !registry.users.contains_key(to)) {
+                    } else if to.is_some_and(|names| {
+                        names
+                            .iter()
+                            .any(|name| !registry.users.contains_key(name.as_str().unwrap()))
+                    }) {
                         Some("user unavailable")
                     } else {
                         if all {
                             broadcast(&registry, line);
                         } else {
                             deliver(&registry.users[from], line.clone());
-                            if let Some(recipient) = to.filter(|recipient| *recipient != from) {
-                                deliver(&registry.users[recipient], line);
+                            let mut sent = HashSet::new();
+                            for recipient in to.unwrap().iter().filter_map(Value::as_str) {
+                                if recipient != from && sent.insert(recipient) {
+                                    deliver(&registry.users[recipient], line.clone());
+                                }
                             }
                         }
                         None

@@ -21,10 +21,12 @@ process environment and the CLI bind argument take precedence.
   records are retained; an older disconnected reservation can be evicted when
   full. Any admitted peer can claim an unreserved name, so names are not
   durable identities.
-- Message: `{"type":"msg","payload":...,"to":"bob"}` or
+- Message: `{"type":"msg","payload":...,"to":["bob","carol"]}` or
   `{"type":"msg","payload":...,"broadcast":true}`. `payload` can be any JSON
-  value; the relay never interprets it. The server stamps `from`; direct
-  messages reach only sender and recipient. Broadcast must be explicit per
+  value; the relay never interprets it. `to` requires 1–64 valid names. If any
+  name is unavailable, nobody receives the message. Duplicate names and the
+  sender each receive one copy. The server stamps `from`; directed messages
+  reach only the sender and named recipients. Broadcast must be explicit per
   message and does not persist between connections. Only routing fields are
   allowed outside `payload`. Each NDJSON line is at most 256 KiB; larger
   payloads require multiple messages. Both routes echo to sender.

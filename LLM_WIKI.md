@@ -91,10 +91,10 @@ All tokens and registrations exist only in server memory. A restart loses
 them. Names are not durable identities: any peer with the shared server
 admission token can claim an unreserved name.
 
-After `welcome`, a direct message has an explicit recipient:
+After `welcome`, a directed message has an array of recipients:
 
 ```json
-{"type":"msg","to":"bob","payload":{"example":[1,true]}}
+{"type":"msg","to":["bob","carol"],"payload":{"example":[1,true]}}
 ```
 
 For every recipient currently registered on this server, a broadcast has an
@@ -105,11 +105,13 @@ setting):
 {"type":"msg","broadcast":true,"payload":"opaque-value"}
 ```
 
-Specify exactly one of `to` or `broadcast:true`; no route is implicit. The
+Specify exactly one of `to` or `broadcast:true`; no route is implicit. `to`
+must contain 1–64 valid names. If any named user is unavailable, the entire
+request fails without delivery. Duplicate names are delivered once. The
 sender receives its own message, and the server adds `"from":"alice"` to
-each delivered message. A direct message reaches only sender and recipient;
-if `to` equals the sender, it is delivered once. A broadcast reaches every
-registered connection, including its sender. Only `type`, `payload`, `to`,
+each delivered message. A directed message reaches only sender and named
+recipients; listing the sender also delivers just one copy. A broadcast reaches
+every registered connection, including its sender. Only `type`, `payload`, `to`,
 and `broadcast` belong on the outer message object. `payload` is required
 but may be any JSON value, including `null`. Put all application-defined
 structure inside it. The server parses JSON framing but does not validate
@@ -130,7 +132,7 @@ Errors are `{"type":"error","error":"..."}`. Bad JSON returns `bad json`
 without closing the connection. Malformed registration, invalid names,
 reserved names without their current token, and invalid messages return
 `invalid registration`, `invalid name`, `name taken`, and `invalid message`
-respectively. A direct message to a missing recipient returns
+respectively. A directed message to a missing recipient returns
 `user unavailable` and is not queued for later. `register first` applies to
 messages and `users` sent before registration. A repeated registration
 returns `already registered`; unrecognized requests return `unknown type`.

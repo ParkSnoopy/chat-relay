@@ -131,9 +131,23 @@ carol = Client()
 carol.register("carol")
 check("third member registered", carol.wait_for(lambda m: m.get("type") == "welcome"))
 direct_payload = {"opaque": [2, {"different": False}]}
-alice.send({"type": "msg", "payload": direct_payload, "to": "bob"})
+alice.send({"type": "msg", "payload": direct_payload, "to": ["bob"]})
 check("direct recipient gets message", bob.wait_for(lambda m: m.get("payload") == direct_payload and m.get("from") == "alice"))
 check("non-recipient gets no direct message", carol.wait_for(lambda m: m.get("payload") == direct_payload, timeout=0.5) is None)
+multi_payload = {"opaque": [3]}
+alice.send({"type": "msg", "payload": multi_payload, "to": ["bob", "carol", "bob", "alice"]})
+check("one request reaches both recipients", all(c.wait_for(lambda m: m.get("payload") == multi_payload and m.get("to") == ["bob", "carol", "bob", "alice"]) for c in (bob, carol)))
+check("sender echoed", alice.wait_for(lambda m: m.get("payload") == multi_payload))
+with alice.lock, bob.lock:
+    check("sender and duplicate recipient delivered once", all(sum(m.get("payload") == multi_payload for m in c.inbox) == 1 for c in (alice, bob)))
+rejected = {"opaque": [4]}
+alice.send({"type": "msg", "payload": rejected, "to": ["bob", "missing"]})
+check("missing recipient rejects entire request", alice.wait_for(lambda m: m.get("error") == "user unavailable") and bob.wait_for(lambda m: m.get("payload") == rejected, timeout=0.5) is None)
+for recipients in ("bob", [], ["bob", 1], ["bob"] * 65):
+    with alice.lock:
+        previous = len(alice.inbox)
+    alice.send({"type": "msg", "payload": rejected, "to": recipients})
+    check("invalid recipient array rejected", alice.wait_for(lambda m: m.get("error") == "invalid message", since=previous))
 alice.send({"type": "msg", "payload": payload})
 check("no implicit broadcast", alice.wait_for(lambda m: m.get("error") == "invalid message"))
 with alice.lock:
