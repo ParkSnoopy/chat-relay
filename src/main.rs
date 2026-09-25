@@ -461,8 +461,11 @@ async fn main() {
         std::env::var("CHAT_RELAY_TLS_CERT"),
         std::env::var("CHAT_RELAY_TLS_KEY"),
     ) {
-        (Ok(cert), Ok(key)) => {
+        (Ok(cert), Ok(key)) if !cert.is_empty() && !key.is_empty() => {
             Some(tls_acceptor(&cert, &key).expect("load TLS certificate and key"))
+        }
+        (Ok(cert), Ok(key)) if cert.is_empty() && key.is_empty() && addr.ip().is_loopback() => {
+            None
         }
         (Err(std::env::VarError::NotPresent), Err(std::env::VarError::NotPresent))
             if addr.ip().is_loopback() =>

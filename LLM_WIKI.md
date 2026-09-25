@@ -25,7 +25,8 @@ the default is `127.0.0.1:6697`. Addresses must be numeric IP:port values,
 not hostnames. The server optionally loads `.env` from its working directory;
 pre-existing process environment variables take precedence. The example
 configuration is [`.env.example`](./.env.example), with its admission secret
-intentionally unset. Only numeric loopback binds may run without TLS. A
+intentionally unset. Set both TLS paths to readable PEM files to enable TLS;
+leave both empty for plaintext on loopback only. A
 non-loopback bind requires both `CHAT_RELAY_TLS_CERT` and
 `CHAT_RELAY_TLS_KEY`, pointing to readable PEM certificate-chain and private-key
 files; peers must verify the certificate against the server name. Both TLS
