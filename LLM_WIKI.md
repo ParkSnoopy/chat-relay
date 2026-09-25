@@ -36,10 +36,15 @@ exits rather than falling back to an insecure listener.
 Token admission is enabled by default. With `CHAT_RELAY_REQUIRE_AUTH_TOKEN=false`,
 registrations omit `server_token`; the server ignores `CHAT_RELAY_AUTH_TOKEN`
 even if present in the environment. A token-free non-loopback bind also requires
-`CHAT_RELAY_ALLOW_UNAUTHENTICATED_NON_LOOPBACK=true`. These settings do **not**
-identify VPN clients or prevent off-VPN access: server-side routing and access
-controls must provide that isolation before enabling this mode. Both flags
-accept only lowercase `true` or `false`; invalid values fail startup.
+either `CHAT_RELAY_VPN_ONLY=true` plus `CHAT_RELAY_VPN_INTERFACE`, or the
+explicitly unsafe override `CHAT_RELAY_ALLOW_UNAUTHENTICATED_NON_LOOPBACK=true`.
+VPN-only mode binds a specific non-loopback IP to the named Linux interface;
+direct mode requires a tunnel interface. For a separate VPN gateway, set
+`CHAT_RELAY_VPN_GATEWAY_IP` to its exact private source IP and choose a private
+listener IP on the selected private ingress. The gateway must reject off-VPN
+traffic before forwarding it; the relay cannot inspect the gateway's VPN policy.
+The unsafe override alone provides **no** VPN isolation. Boolean flags accept
+only lowercase `true` or `false`; invalid values fail startup.
 
 To check a running loopback relay, run the repository smoke test in another
 terminal with the **same** `CHAT_RELAY_AUTH_TOKEN` in that terminal's
@@ -50,9 +55,10 @@ python3 tests/relay_smoke.py
 ```
 
 The server's `.env` is not loaded by the Python test. For a test TLS listener,
-set `TEST_RELAY_PORT` to its port and `TEST_RELAY_TLS_CERT` to the certificate
-trusted by the test; it connects to `127.0.0.1` and verifies `localhost`. For
-token-free mode set `TEST_RELAY_AUTH_REQUIRED=false` in the test environment.
+set `TEST_RELAY_HOST` and `TEST_RELAY_PORT` to its address and port, and
+`TEST_RELAY_TLS_CERT` to the certificate trusted by the test; it verifies
+`localhost`. For token-free mode set `TEST_RELAY_AUTH_REQUIRED=false` in the
+test environment.
 
 The [Dockerfile](./Dockerfile) builds `linux/amd64` in the publication workflow
 and starts the binary as UID/GID 65532. Build locally with
@@ -60,7 +66,10 @@ and starts the binary as UID/GID 65532. Build locally with
 `CHAT_RELAY_ADDR=0.0.0.0:6697` (loopback inside the container is unreachable
 through a published port), provide the admission token unless disabled and both
 TLS file paths as environment variables, mount those files readably for UID
-65532, and publish TCP port 6697. TLS is mandatory on this container bind.
+65532, and publish TCP port 6697 only for deployments that intentionally expose
+it. TLS is mandatory on this container bind.
+For VPN-only mode, the selected interface must exist inside the container's
+network namespace; do not expose its listener through a public Docker port.
 The [publication workflow](./.github/workflows/publish-container.yml) pushes
 `ghcr.io/<lowercase-owner>/<lowercase-repo>` for pushed `v*` SemVer tags,
 with version and major.minor tags; it does not publish `latest`.

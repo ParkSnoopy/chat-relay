@@ -1,13 +1,28 @@
 """Smoke test for a running relay in either token admission mode.
 
-Set TEST_RELAY_PORT and TEST_RELAY_TLS_CERT for a TLS listener.
+Set TEST_RELAY_HOST, TEST_RELAY_PORT and TEST_RELAY_TLS_CERT for a TLS listener.
+Set TEST_RELAY_DENIED_SOURCE_IP to check gateway source rejection before TLS.
 """
 import json, select, socket, ssl, threading, time, os
 
-ADDR = ("127.0.0.1", int(os.environ.get("TEST_RELAY_PORT", "6697")))
+ADDR = (os.environ.get("TEST_RELAY_HOST", "127.0.0.1"), int(os.environ.get("TEST_RELAY_PORT", "6697")))
 AUTH_REQUIRED = os.environ.get("TEST_RELAY_AUTH_REQUIRED", "true") == "true"
 SERVER_TOKEN = os.environ["CHAT_RELAY_AUTH_TOKEN"] if AUTH_REQUIRED else None
 TLS_CERT = os.environ.get("TEST_RELAY_TLS_CERT")
+
+if os.environ.get("TEST_RELAY_DENIED_SOURCE_IP"):
+    assert TLS_CERT, "denied-source check requires TEST_RELAY_TLS_CERT"
+    denied = socket.socket()
+    denied.settimeout(1)
+    try:
+        denied.bind((os.environ["TEST_RELAY_DENIED_SOURCE_IP"], 0))
+        denied.connect(ADDR)
+        ssl.create_default_context(cafile=TLS_CERT).wrap_socket(denied, server_hostname="localhost")
+        raise AssertionError("untrusted source completed TLS handshake")
+    except OSError:
+        print("PASS untrusted source rejected before TLS")
+    finally:
+        denied.close()
 
 class Client:
     def __init__(self):

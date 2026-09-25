@@ -9,11 +9,19 @@ numeric loopback bind address. Any other bind requires a TLS certificate and
 private key (`CHAT_RELAY_TLS_CERT`, `CHAT_RELAY_TLS_KEY`); peers must verify
 the certificate and hostname. By default `CHAT_RELAY_AUTH_TOKEN` is required:
 64 random hexadecimal characters. `CHAT_RELAY_REQUIRE_AUTH_TOKEN=false`
-disables this check and rejects the `server_token` registration field. For
-non-loopback binds in that mode,
-`CHAT_RELAY_ALLOW_UNAUTHENTICATED_NON_LOOPBACK=true` must also be set explicitly.
-This flag does not enforce VPN isolation; restrict access on the server before
-enabling it. No secret is embedded in the container image.
+disables this check and rejects the `server_token` registration field. For non-loopback binds in that mode, either set `CHAT_RELAY_VPN_ONLY=true`
+with `CHAT_RELAY_VPN_INTERFACE` or explicitly opt out of ingress protection
+with `CHAT_RELAY_ALLOW_UNAUTHENTICATED_NON_LOOPBACK=true`. The latter does not
+enforce VPN isolation and must not be used as evidence of VPN-only admission.
+VPN-only mode requires a specific non-loopback listener address and Linux
+interface binding (`SO_BINDTODEVICE`); the listener fails closed if the
+interface is unavailable. For direct VPN ingress the interface must be a
+tunnel device. For a separate gateway, set `CHAT_RELAY_VPN_GATEWAY_IP` to its
+exact private source address and bind to a private address on the selected
+ingress interface. Only that source can reach TLS/registration. The gateway
+must itself exclude off-VPN traffic; the relay cannot verify its upstream
+policy. TLS remains mandatory for either non-loopback mode. No secret is
+embedded in the container image.
 `.env` is loaded from the working directory;
 process environment and the CLI bind argument take precedence.
 

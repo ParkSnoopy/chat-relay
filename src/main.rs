@@ -13,7 +13,7 @@ use std::{
         self,
         BufReader,
     },
-    net::SocketAddr,
+    net::{IpAddr, SocketAddr},
     sync::{
         Arc,
         Mutex,
@@ -48,6 +48,8 @@ use tokio_rustls::{
     TlsAcceptor,
     rustls,
 };
+#[cfg(target_os = "linux")]
+use tokio::net::TcpSocket;
 use tokio_stream::StreamExt;
 use tokio_util::codec::{
     FramedRead,
@@ -84,6 +86,11 @@ struct State {
     auth_token: Option<String>,
 }
 
+struct VpnIngress {
+    interface: String,
+    gateway: Option<IpAddr>,
+}
+
 fn token() -> String {
     format!("{:032x}", rand::random::<u128>())
 }
@@ -103,6 +110,98 @@ fn bool_env(name: &str, default: bool) -> bool {
         Err(std::env::VarError::NotPresent) => default,
         _ => panic!("{name} must be true or false"),
     }
+}
+
+fn private_ip(ip: IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(ip) => ip.is_private(),
+        IpAddr::V6(ip) => ip.is_unique_local(),
+    }
+}
+
+fn optional_env(name: &str) -> Option<String> {
+    match std::env::var(name) {
+        Ok(value) if !value.is_empty() => Some(value),
+        Ok(_) => None,
+        Err(std::env::VarError::NotPresent) => None,
+        Err(_) => panic!("{name} must be valid UTF-8"),
+    }
+}
+
+fn vpn_ingress(addr: SocketAddr, enabled: bool) -> Option<VpnIngress> {
+    let interface = optional_env("CHAT_RELAY_VPN_INTERFACE");
+    let gateway = optional_env("CHAT_RELAY_VPN_GATEWAY_IP");
+    if !enabled {
+        assert!(
+            interface.is_none() && gateway.is_none(),
+            "VPN ingress settings require CHAT_RELAY_VPN_ONLY=true"
+        );
+        return None;
+    }
+    assert!(
+        !addr.ip().is_unspecified() && !addr.ip().is_loopback(),
+        "VPN-only bind must select a non-loopback IP"
+    );
+    let interface = interface.expect("CHAT_RELAY_VPN_INTERFACE required");
+    assert!(
+        !interface.is_empty()
+            && interface.len() <= 15
+            && !interface.starts_with('.')
+            && interface
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-' | b'.')),
+        "invalid VPN interface name"
+    );
+    let gateway = gateway
+        .map(|ip| ip.parse::<IpAddr>().expect("invalid CHAT_RELAY_VPN_GATEWAY_IP"));
+    if let Some(gateway) = gateway {
+        assert!(
+            gateway.is_ipv4() == addr.ip().is_ipv4(),
+            "VPN gateway and listener IP families differ"
+        );
+        assert!(
+            private_ip(addr.ip()) && private_ip(gateway),
+            "gateway ingress requires private listener and gateway IPs"
+        );
+    }
+    Some(VpnIngress { interface, gateway })
+}
+
+async fn bind_listener(addr: SocketAddr, ingress: Option<&VpnIngress>) -> io::Result<TcpListener> {
+    if let Some(ingress) = ingress {
+        #[cfg(target_os = "linux")]
+        {
+            use std::os::fd::AsRawFd;
+
+            let socket = if addr.is_ipv4() {
+                TcpSocket::new_v4()?
+            } else {
+                TcpSocket::new_v6()?
+            };
+            if ingress.gateway.is_none() {
+                // SIOCGIFHWADDR reads the interface in this socket's network namespace.
+                let mut request: libc::ifreq = unsafe { std::mem::zeroed() };
+                for (target, source) in request.ifr_name.iter_mut().zip(ingress.interface.bytes()) {
+                    *target = source as libc::c_char;
+                }
+                if unsafe { libc::ioctl(socket.as_raw_fd(), libc::SIOCGIFHWADDR, &mut request) } < 0 {
+                    return Err(io::Error::last_os_error());
+                }
+                if unsafe { request.ifr_ifru.ifru_hwaddr.sa_family } != libc::ARPHRD_NONE {
+                    return Err(io::Error::other("direct VPN ingress requires a tunnel interface"));
+                }
+            }
+            socket.bind_device(Some(ingress.interface.as_bytes()))?;
+            socket.bind(addr)?;
+            return socket.listen(1024);
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            let _ = ingress;
+            return Err(io::Error::other("VPN ingress requires Linux SO_BINDTODEVICE"));
+        }
+    }
+    TcpListener::bind(addr).await
 }
 
 fn deliver(session: &Session, line: Arc<String>) {
@@ -476,9 +575,11 @@ async fn main() {
         .or_else(|| std::env::var("CHAT_RELAY_ADDR").ok())
         .unwrap_or_else(|| "127.0.0.1:6697".to_string());
     let addr: SocketAddr = addr.parse().expect("CHAT_RELAY_ADDR must be IP:port");
+    let vpn_only = bool_env("CHAT_RELAY_VPN_ONLY", false);
+    let ingress = vpn_ingress(addr, vpn_only);
     assert!(
-        require_auth_token || addr.ip().is_loopback() || allow_unauthenticated_non_loopback,
-        "token-free non-loopback bind requires CHAT_RELAY_ALLOW_UNAUTHENTICATED_NON_LOOPBACK=true"
+        require_auth_token || addr.ip().is_loopback() || allow_unauthenticated_non_loopback || vpn_only,
+        "token-free non-loopback bind requires VPN-only ingress or CHAT_RELAY_ALLOW_UNAUTHENTICATED_NON_LOOPBACK=true"
     );
     let tls = match (
         std::env::var("CHAT_RELAY_TLS_CERT"),
@@ -497,7 +598,7 @@ async fn main() {
         }
         _ => panic!("TLS certificate and key required for non-loopback bind"),
     };
-    let listener = TcpListener::bind(addr).await.expect("bind");
+    let listener = bind_listener(addr, ingress.as_ref()).await.expect("bind ingress");
     println!("chat-relay listening on {addr}");
     let state = Arc::new(State {
         registry: Mutex::new(Registry::default()),
@@ -506,6 +607,13 @@ async fn main() {
     let slots = Arc::new(Semaphore::new(MAX_CONNECTIONS));
     loop {
         let (sock, peer) = listener.accept().await.expect("accept");
+        if ingress
+            .as_ref()
+            .and_then(|vpn| vpn.gateway)
+            .is_some_and(|gateway| peer.ip() != gateway)
+        {
+            continue;
+        }
         let Ok(permit) = slots.clone().try_acquire_owned() else {
             continue;
         };
