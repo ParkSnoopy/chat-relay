@@ -1,14 +1,17 @@
 """Smoke test for a running relay in either token admission mode.
 
 Set TEST_RELAY_HOST, TEST_RELAY_PORT and TEST_RELAY_TLS_CERT for a TLS listener.
-Set TEST_RELAY_DENIED_SOURCE_IP to check gateway source rejection before TLS.
+Set TEST_RELAY_SOURCE_IPS to exercise several allowed source IPs, and
+TEST_RELAY_DENIED_SOURCE_IP to check rejection before TLS.
 """
-import json, select, socket, ssl, threading, time, os
+import itertools, json, select, socket, ssl, threading, time, os
 
 ADDR = (os.environ.get("TEST_RELAY_HOST", "127.0.0.1"), int(os.environ.get("TEST_RELAY_PORT", "6697")))
 AUTH_REQUIRED = os.environ.get("TEST_RELAY_AUTH_REQUIRED", "true") == "true"
 SERVER_TOKEN = os.environ["CHAT_RELAY_AUTH_TOKEN"] if AUTH_REQUIRED else None
 TLS_CERT = os.environ.get("TEST_RELAY_TLS_CERT")
+SOURCES = os.environ.get("TEST_RELAY_SOURCE_IPS", "")
+SOURCE_CYCLE = itertools.cycle(SOURCES.split(",")) if SOURCES else None
 
 if os.environ.get("TEST_RELAY_DENIED_SOURCE_IP"):
     assert TLS_CERT, "denied-source check requires TEST_RELAY_TLS_CERT"
@@ -26,7 +29,10 @@ if os.environ.get("TEST_RELAY_DENIED_SOURCE_IP"):
 
 class Client:
     def __init__(self):
-        self.sock = socket.create_connection(ADDR, timeout=5)
+        self.sock = socket.create_connection(
+            ADDR, timeout=5,
+            source_address=(next(SOURCE_CYCLE), 0) if SOURCE_CYCLE else None,
+        )
         if TLS_CERT:
             self.sock = ssl.create_default_context(cafile=TLS_CERT).wrap_socket(self.sock, server_hostname="localhost")
         self.sock.settimeout(0.25 if TLS_CERT else None)

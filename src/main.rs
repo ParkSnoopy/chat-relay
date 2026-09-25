@@ -88,7 +88,7 @@ struct State {
 
 struct VpnIngress {
     interface: String,
-    gateway: Option<IpAddr>,
+    gateways: Option<HashSet<IpAddr>>,
 }
 
 fn token() -> String {
@@ -128,12 +128,56 @@ fn optional_env(name: &str) -> Option<String> {
     }
 }
 
+fn gateway_sources(
+    single: Option<&str>,
+    multiple: Option<&str>,
+    listener: IpAddr,
+) -> Option<HashSet<IpAddr>> {
+    assert!(
+        single.is_none() || multiple.is_none(),
+        "choose one VPN gateway source setting"
+    );
+    let value = single.or(multiple)?;
+    let sources: Vec<_> = if single.is_some() {
+        vec![value]
+    } else {
+        value.split(',').collect()
+    };
+    assert!(
+        !sources.is_empty() && sources.len() <= 16,
+        "VPN gateway source list must contain 1 to 16 IPs"
+    );
+    let mut gateways = HashSet::with_capacity(sources.len());
+    for source in sources {
+        let ip = source
+            .parse::<IpAddr>()
+            .expect("VPN gateway source must be a numeric IP");
+        assert!(
+            ip.is_ipv4() == listener.is_ipv4(),
+            "VPN gateway and listener IP families differ"
+        );
+        assert!(
+            private_ip(listener) && private_ip(ip) && ip != listener,
+            "gateway ingress requires distinct private listener and source IPs"
+        );
+        assert!(gateways.insert(ip), "duplicate VPN gateway source IP");
+    }
+    Some(gateways)
+}
+
+fn peer_allowed(ingress: Option<&VpnIngress>, peer: IpAddr) -> bool {
+    ingress
+        .and_then(|vpn| vpn.gateways.as_ref())
+        .is_none_or(|gateways| gateways.contains(&peer))
+}
+
 fn vpn_ingress(addr: SocketAddr, enabled: bool) -> Option<VpnIngress> {
     let interface = optional_env("CHAT_RELAY_VPN_INTERFACE");
     let gateway = optional_env("CHAT_RELAY_VPN_GATEWAY_IP");
+    let gateways = optional_env("CHAT_RELAY_VPN_GATEWAY_IPS");
     if !enabled {
         assert!(
-            interface.is_none() && gateway.is_none(),
+            interface.is_none() && gateway.is_none() && gateways.is_none(),
             "VPN ingress settings require CHAT_RELAY_VPN_ONLY=true"
         );
         return None;
@@ -152,19 +196,11 @@ fn vpn_ingress(addr: SocketAddr, enabled: bool) -> Option<VpnIngress> {
                 .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-' | b'.')),
         "invalid VPN interface name"
     );
-    let gateway = gateway
-        .map(|ip| ip.parse::<IpAddr>().expect("invalid CHAT_RELAY_VPN_GATEWAY_IP"));
-    if let Some(gateway) = gateway {
-        assert!(
-            gateway.is_ipv4() == addr.ip().is_ipv4(),
-            "VPN gateway and listener IP families differ"
-        );
-        assert!(
-            private_ip(addr.ip()) && private_ip(gateway),
-            "gateway ingress requires private listener and gateway IPs"
-        );
-    }
-    Some(VpnIngress { interface, gateway })
+    let gateways = gateway_sources(gateway.as_deref(), gateways.as_deref(), addr.ip());
+    Some(VpnIngress {
+        interface,
+        gateways,
+    })
 }
 
 async fn bind_listener(addr: SocketAddr, ingress: Option<&VpnIngress>) -> io::Result<TcpListener> {
@@ -178,7 +214,7 @@ async fn bind_listener(addr: SocketAddr, ingress: Option<&VpnIngress>) -> io::Re
             } else {
                 TcpSocket::new_v6()?
             };
-            if ingress.gateway.is_none() {
+            if ingress.gateways.is_none() {
                 // SIOCGIFHWADDR reads the interface in this socket's network namespace.
                 let mut request: libc::ifreq = unsafe { std::mem::zeroed() };
                 for (target, source) in request.ifr_name.iter_mut().zip(ingress.interface.bytes()) {
@@ -607,11 +643,7 @@ async fn main() {
     let slots = Arc::new(Semaphore::new(MAX_CONNECTIONS));
     loop {
         let (sock, peer) = listener.accept().await.expect("accept");
-        if ingress
-            .as_ref()
-            .and_then(|vpn| vpn.gateway)
-            .is_some_and(|gateway| peer.ip() != gateway)
-        {
+        if !peer_allowed(ingress.as_ref(), peer.ip()) {
             continue;
         }
         let Ok(permit) = slots.clone().try_acquire_owned() else {
@@ -635,6 +667,60 @@ async fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn multiple_vpn_gateway_sources_allow_only_listed_peers() {
+        let listener = "172.24.0.10".parse().unwrap();
+        let gateways = gateway_sources(None, Some("172.24.0.2,172.24.0.3"), listener).unwrap();
+        let ingress = VpnIngress {
+            interface: "eth0".into(),
+            gateways: Some(gateways),
+        };
+        assert!(peer_allowed(Some(&ingress), "172.24.0.2".parse().unwrap()));
+        assert!(peer_allowed(Some(&ingress), "172.24.0.3".parse().unwrap()));
+        assert!(!peer_allowed(Some(&ingress), "172.24.0.4".parse().unwrap()));
+        assert!(!peer_allowed(Some(&ingress), "172.24.0.1".parse().unwrap()));
+        assert!(peer_allowed(None, "172.24.0.4".parse().unwrap()));
+        assert_eq!(
+            gateway_sources(Some("172.24.0.2"), None, listener).unwrap(),
+            HashSet::from(["172.24.0.2".parse().unwrap()])
+        );
+    }
+
+    #[test]
+    fn gateway_sources_reject_ambiguous_or_broad_admission() {
+        let listener = "172.24.0.10".parse().unwrap();
+        for (single, multiple) in [
+            (Some("172.24.0.2"), Some("172.24.0.3")),
+            (None, Some("")),
+            (None, Some("172.24.0.2,")),
+            (None, Some("172.24.0.2,172.24.0.2")),
+            (None, Some("0.0.0.0")),
+            (None, Some("172.24.0.10")),
+            (None, Some("172.24.0.0/24")),
+            (None, Some("chat-engine")),
+            (None, Some("8.8.8.8")),
+            (None, Some("fd00::2")),
+        ] {
+            assert!(
+                std::panic::catch_unwind(|| gateway_sources(single, multiple, listener)).is_err(),
+                "accepted gateway sources {single:?} {multiple:?}"
+            );
+        }
+        let too_many = (1..=17)
+            .map(|last| format!("172.24.1.{last}"))
+            .collect::<Vec<_>>()
+            .join(",");
+        assert!(
+            std::panic::catch_unwind(|| gateway_sources(None, Some(&too_many), listener)).is_err()
+        );
+        assert_eq!(
+            gateway_sources(None, Some("fd12::2,fd12::3"), "fd12::10".parse().unwrap())
+                .unwrap()
+                .len(),
+            2
+        );
+    }
 
     #[test]
     fn slow_recipient_does_not_block_others() {

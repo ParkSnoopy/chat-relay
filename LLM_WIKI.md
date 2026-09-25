@@ -41,8 +41,14 @@ explicitly unsafe override `CHAT_RELAY_ALLOW_UNAUTHENTICATED_NON_LOOPBACK=true`.
 VPN-only mode binds a specific non-loopback IP to the named Linux interface;
 direct mode requires a tunnel interface. For a separate VPN gateway, set
 `CHAT_RELAY_VPN_GATEWAY_IP` to its exact private source IP and choose a private
-listener IP on the selected private ingress. The gateway must reject off-VPN
-traffic before forwarding it; the relay cannot inspect the gateway's VPN policy.
+listener IP on the selected private ingress. For several VPN engine containers,
+set `CHAT_RELAY_VPN_GATEWAY_IPS` to their comma-separated exact private source
+IPs instead; do not set both variables. The list accepts 1–16 unique numeric
+private IPs of the listener's address family, not DNS names, Docker container
+names, CIDRs or wildcard sources. Container names can resolve to changed IPs
+after replacement; inspect the owned containers and update the list before
+restarting the relay. Each engine must reject off-VPN traffic before reaching
+this ingress; the relay cannot inspect upstream VPN policy.
 The unsafe override alone provides **no** VPN isolation. Boolean flags accept
 only lowercase `true` or `false`; invalid values fail startup.
 

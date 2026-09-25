@@ -18,10 +18,16 @@ interface binding (`SO_BINDTODEVICE`); the listener fails closed if the
 interface is unavailable. For direct VPN ingress the interface must be a
 tunnel device. For a separate gateway, set `CHAT_RELAY_VPN_GATEWAY_IP` to its
 exact private source address and bind to a private address on the selected
-ingress interface. Only that source can reach TLS/registration. The gateway
-must itself exclude off-VPN traffic; the relay cannot verify its upstream
-policy. TLS remains mandatory for either non-loopback mode. No secret is
-embedded in the container image.
+ingress interface. For multiple VPN engine containers, set
+`CHAT_RELAY_VPN_GATEWAY_IPS` to a comma-separated list of their exact private
+source IPs instead; the settings are mutually exclusive. Between one and 16
+distinct IPs of the listener's address family are allowed. No hostnames,
+CIDRs, public IPs or wildcard sources are accepted. Only listed sources can
+reach TLS/registration. Docker container names are not source identities:
+resolve each owned container's current IP before starting the relay and update
+the list when containers are replaced. Each engine must itself exclude off-VPN
+traffic; the relay cannot verify its upstream policy. TLS remains mandatory
+for either non-loopback mode. No secret is embedded in the container image.
 `.env` is loaded from the working directory;
 process environment and the CLI bind argument take precedence.
 
