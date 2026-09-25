@@ -7,12 +7,18 @@ For a self-contained repository user guide, see [LLM_WIKI.md](./LLM_WIKI.md).
 NDJSON, one JSON object per line. The server accepts plain TCP only on a
 numeric loopback bind address. Any other bind requires a TLS certificate and
 private key (`CHAT_RELAY_TLS_CERT`, `CHAT_RELAY_TLS_KEY`); peers must verify
-the certificate and hostname. `CHAT_RELAY_AUTH_TOKEN` is mandatory: 64 random
-hexadecimal characters. No secret is embedded in the container image.
+the certificate and hostname. By default `CHAT_RELAY_AUTH_TOKEN` is required:
+64 random hexadecimal characters. `CHAT_RELAY_REQUIRE_AUTH_TOKEN=false`
+disables this check and rejects the `server_token` registration field. For
+non-loopback binds in that mode,
+`CHAT_RELAY_ALLOW_UNAUTHENTICATED_NON_LOOPBACK=true` must also be set explicitly.
+This flag does not enforce VPN isolation; restrict access on the server before
+enabling it. No secret is embedded in the container image.
 `.env` is loaded from the working directory;
 process environment and the CLI bind argument take precedence.
 
-- Register: `{"type":"register","name":"alice","server_token":"..."}`.
+- Register: `{"type":"register","name":"alice","server_token":"..."}`
+  when admission is enabled; omit `server_token` when it is disabled.
   Names contain 1–32 ASCII letters, digits, hyphens or underscores. A successful
   registration receives `{"type":"welcome","user":"alice","token":"..."}`.
   The 128-bit per-name token can reclaim an active or recently disconnected

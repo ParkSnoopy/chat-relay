@@ -11,10 +11,10 @@ the linked files at the end are optional references.
 
 ## Run it
 
-Build/run with a Rust toolchain supporting edition 2024. Set
+Build/run with a Rust toolchain supporting edition 2024. By default set
 `CHAT_RELAY_AUTH_TOKEN` in the process environment to a **64-character
 hexadecimal** server admission secret before starting. The server refuses to
-start without it. On the local machine:
+start without it unless `CHAT_RELAY_REQUIRE_AUTH_TOKEN=false`. On the local machine:
 
 ```sh
 cargo run --locked -- 127.0.0.1:6697
@@ -33,9 +33,17 @@ files; peers must verify the certificate against the server name. Both TLS
 settings may also be supplied on a loopback bind. Failed configuration or bind
 exits rather than falling back to an insecure listener.
 
+Token admission is enabled by default. With `CHAT_RELAY_REQUIRE_AUTH_TOKEN=false`,
+registrations omit `server_token`; the server ignores `CHAT_RELAY_AUTH_TOKEN`
+even if present in the environment. A token-free non-loopback bind also requires
+`CHAT_RELAY_ALLOW_UNAUTHENTICATED_NON_LOOPBACK=true`. These settings do **not**
+identify VPN clients or prevent off-VPN access: server-side routing and access
+controls must provide that isolation before enabling this mode. Both flags
+accept only lowercase `true` or `false`; invalid values fail startup.
+
 To check a running loopback relay, run the repository smoke test in another
 terminal with the **same** `CHAT_RELAY_AUTH_TOKEN` in that terminal's
-environment:
+environment when admission is enabled:
 
 ```sh
 python3 tests/relay_smoke.py
@@ -43,14 +51,15 @@ python3 tests/relay_smoke.py
 
 The server's `.env` is not loaded by the Python test. For a test TLS listener,
 set `TEST_RELAY_PORT` to its port and `TEST_RELAY_TLS_CERT` to the certificate
-trusted by the test; it connects to `127.0.0.1` and verifies `localhost`.
+trusted by the test; it connects to `127.0.0.1` and verifies `localhost`. For
+token-free mode set `TEST_RELAY_AUTH_REQUIRED=false` in the test environment.
 
 The [Dockerfile](./Dockerfile) builds `linux/amd64` in the publication workflow
 and starts the binary as UID/GID 65532. Build locally with
 `docker build -t chat-relay:local .`. In a container, set
 `CHAT_RELAY_ADDR=0.0.0.0:6697` (loopback inside the container is unreachable
-through a published port), provide the admission token and both TLS file paths
-as environment variables, mount those certificate files readably for UID
+through a published port), provide the admission token unless disabled and both
+TLS file paths as environment variables, mount those files readably for UID
 65532, and publish TCP port 6697. TLS is mandatory on this container bind.
 The [publication workflow](./.github/workflows/publish-container.yml) pushes
 `ghcr.io/<lowercase-owner>/<lowercase-repo>` for pushed `v*` SemVer tags,
@@ -81,7 +90,8 @@ request. The first operation is registration:
 
 Names are 1–32 bytes of ASCII letters, digits, `_` or `-`. Successful
 registration sends `{"type":"welcome","user":"alice","token":"..."}`.
-`server_token` admits a peer to this server; the returned per-name `token`
+When admission is disabled, omit `server_token` from registration entirely.
+Otherwise it admits a peer to this server; the returned per-name `token`
 is a different, 128-bit secret for reclaiming that name. Retain the newest
 returned token if reclaim is needed. A peer already holding a reclaim token
 registers with the same fields plus `"token":"<newest-name-token>"`.
@@ -89,8 +99,8 @@ Reclaim rotates the name token and closes its previous connection, including
 when that connection is still active. A claimed name stays reserved for its
 token holder for 10 minutes after disconnect; after that it becomes free.
 All tokens and registrations exist only in server memory. A restart loses
-them. Names are not durable identities: any peer with the shared server
-admission token can claim an unreserved name.
+them. Names are not durable identities: any admitted peer can claim an
+unreserved name.
 
 After `welcome`, a directed message has an array of recipients:
 
@@ -137,7 +147,8 @@ respectively. A directed message to a missing recipient returns
 `user unavailable` and is not queued for later. `register first` applies to
 messages and `users` sent before registration. A repeated registration
 returns `already registered`; unrecognized requests return `unknown type`.
-Wrong server admission yields `unauthorized` and closes the connection.
+Missing or wrong server admission when enabled yields `unauthorized` and closes
+the connection. A `server_token` field in token-free mode is invalid registration.
 Other invalid requests normally leave the connection open; EOF, timeouts,
 oversized lines, and slow readers close it. Delivery after a disconnected
 send is unknown: a sender echo does not confirm recipient receipt, and the

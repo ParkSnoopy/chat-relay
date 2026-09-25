@@ -81,7 +81,7 @@ struct TokenRecord {
 
 struct State {
     registry: Mutex<Registry>,
-    auth_token: String,
+    auth_token: Option<String>,
 }
 
 fn token() -> String {
@@ -94,6 +94,15 @@ fn valid_name(name: &str) -> bool {
         && name
             .bytes()
             .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
+}
+
+fn bool_env(name: &str, default: bool) -> bool {
+    match std::env::var(name) {
+        Ok(value) if value == "true" => true,
+        Ok(value) if value == "false" => false,
+        Err(std::env::VarError::NotPresent) => default,
+        _ => panic!("{name} must be true or false"),
+    }
 }
 
 fn deliver(session: &Session, line: Arc<String>) {
@@ -172,17 +181,19 @@ where
                     }
                     continue;
                 }
-                if !msg
-                    .get("server_token")
-                    .and_then(Value::as_str)
-                    .is_some_and(|t| t.as_bytes().ct_eq(state.auth_token.as_bytes()).into())
+                if let Some(auth_token) = state.auth_token.as_ref()
+                    && !msg
+                        .get("server_token")
+                        .and_then(Value::as_str)
+                        .is_some_and(|t| t.as_bytes().ct_eq(auth_token.as_bytes()).into())
                 {
                     let _ = reply(&tx, json!({"type": "error", "error": "unauthorized"}));
                     break;
                 }
                 if !msg.as_object().is_some_and(|fields| {
                     fields.keys().all(|key| {
-                        matches!(key.as_str(), "type" | "name" | "token" | "server_token")
+                        matches!(key.as_str(), "type" | "name" | "token")
+                            || (key == "server_token" && state.auth_token.is_some())
                     })
                 }) || msg.get("token").is_some_and(|v| !v.is_string())
                 {
@@ -446,17 +457,29 @@ async fn main() {
     if std::fs::exists(".env").expect("inspect .env") {
         dotenvy::from_filename(".env").unwrap_or_else(|_| panic!("invalid .env"));
     }
-    let auth_token =
-        std::env::var("CHAT_RELAY_AUTH_TOKEN").expect("CHAT_RELAY_AUTH_TOKEN required");
-    assert!(
-        auth_token.len() == 64 && auth_token.bytes().all(|b| b.is_ascii_hexdigit()),
-        "CHAT_RELAY_AUTH_TOKEN must be 64 hexadecimal characters"
-    );
+    let require_auth_token = bool_env("CHAT_RELAY_REQUIRE_AUTH_TOKEN", true);
+    let allow_unauthenticated_non_loopback =
+        bool_env("CHAT_RELAY_ALLOW_UNAUTHENTICATED_NON_LOOPBACK", false);
+    let auth_token = if require_auth_token {
+        let auth_token =
+            std::env::var("CHAT_RELAY_AUTH_TOKEN").expect("CHAT_RELAY_AUTH_TOKEN required");
+        assert!(
+            auth_token.len() == 64 && auth_token.bytes().all(|b| b.is_ascii_hexdigit()),
+            "CHAT_RELAY_AUTH_TOKEN must be 64 hexadecimal characters"
+        );
+        Some(auth_token)
+    } else {
+        None
+    };
     let addr = std::env::args()
         .nth(1)
         .or_else(|| std::env::var("CHAT_RELAY_ADDR").ok())
         .unwrap_or_else(|| "127.0.0.1:6697".to_string());
     let addr: SocketAddr = addr.parse().expect("CHAT_RELAY_ADDR must be IP:port");
+    assert!(
+        require_auth_token || addr.ip().is_loopback() || allow_unauthenticated_non_loopback,
+        "token-free non-loopback bind requires CHAT_RELAY_ALLOW_UNAUTHENTICATED_NON_LOOPBACK=true"
+    );
     let tls = match (
         std::env::var("CHAT_RELAY_TLS_CERT"),
         std::env::var("CHAT_RELAY_TLS_KEY"),

@@ -1,11 +1,12 @@
-"""Smoke test for a running relay with matching CHAT_RELAY_AUTH_TOKEN.
+"""Smoke test for a running relay in either token admission mode.
 
 Set TEST_RELAY_PORT and TEST_RELAY_TLS_CERT for a TLS listener.
 """
 import json, select, socket, ssl, threading, time, os
 
 ADDR = ("127.0.0.1", int(os.environ.get("TEST_RELAY_PORT", "6697")))
-SERVER_TOKEN = os.environ["CHAT_RELAY_AUTH_TOKEN"]
+AUTH_REQUIRED = os.environ.get("TEST_RELAY_AUTH_REQUIRED", "true") == "true"
+SERVER_TOKEN = os.environ["CHAT_RELAY_AUTH_TOKEN"] if AUTH_REQUIRED else None
 TLS_CERT = os.environ.get("TEST_RELAY_TLS_CERT")
 
 class Client:
@@ -64,7 +65,9 @@ class Client:
             self.sock.sendall(data)
 
     def register(self, name, token=None):
-        msg = {"type": "register", "name": name, "server_token": SERVER_TOKEN}
+        msg = {"type": "register", "name": name}
+        if AUTH_REQUIRED:
+            msg["server_token"] = SERVER_TOKEN
         if token is not None:
             msg["token"] = token
         self.send(msg)
@@ -110,7 +113,11 @@ check("dup name rejected", eve.wait_for(lambda m: m.get("type") == "error" and m
 
 unauthorized = Client()
 unauthorized.send({"type": "register", "name": "mallory", "server_token": "wrong"})
-check("server admission required", unauthorized.wait_for(lambda m: m.get("error") == "unauthorized"))
+check("token handling matches admission mode", unauthorized.wait_for(lambda m: m.get("error") == ("unauthorized" if AUTH_REQUIRED else "invalid registration")))
+if AUTH_REQUIRED:
+    missing = Client()
+    missing.send({"type": "register", "name": "mallory"})
+    check("missing admission token rejected", missing.wait_for(lambda m: m.get("error") == "unauthorized"))
 invalid = Client()
 invalid.register("fake\nlog")
 check("unsafe name rejected", invalid.wait_for(lambda m: m.get("error") == "invalid name"))
