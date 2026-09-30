@@ -84,6 +84,7 @@ struct TokenRecord {
 struct State {
     registry: Mutex<Registry>,
     auth_token: Option<String>,
+    max_content_size: usize,
 }
 
 struct VpnIngress {
@@ -97,10 +98,21 @@ fn token() -> String {
 
 fn valid_name(name: &str) -> bool {
     !name.is_empty()
-        && name.len() <= 32
+        && name.chars().count() <= 32
         && name
-            .bytes()
-            .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
+            .chars()
+            .all(|c| c.is_alphanumeric() || c == '_' || c == '-')
+}
+
+fn content_size_limit(value: Option<&str>) -> usize {
+    match value {
+        None => MAX_LINE,
+        Some(value) => value
+            .parse::<usize>()
+            .ok()
+            .filter(|size| *size > 0 && *size <= isize::MAX as usize)
+            .expect("CHAT_RELAY_MAX_CONTENT_SIZE must be a positive byte count"),
+    }
 }
 
 fn bool_env(name: &str, default: bool) -> bool {
@@ -261,7 +273,7 @@ where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
     let (rd, wr) = tokio::io::split(sock);
-    let mut reader = FramedRead::new(rd, LinesCodec::new_with_max_length(MAX_LINE));
+    let mut reader = FramedRead::new(rd, LinesCodec::new_with_max_length(state.max_content_size));
     let mut writer = BufWriter::new(wr);
     let (tx, mut rx) = mpsc::channel::<Arc<String>>(TX_BUFFER);
     let (shutdown_tx, mut shutdown_rx) = watch::channel(false);
@@ -634,11 +646,17 @@ async fn main() {
         }
         _ => panic!("TLS certificate and key required for non-loopback bind"),
     };
+    let max_content_size = match std::env::var("CHAT_RELAY_MAX_CONTENT_SIZE") {
+        Ok(value) => content_size_limit(Some(&value)),
+        Err(std::env::VarError::NotPresent) => content_size_limit(None),
+        Err(_) => panic!("CHAT_RELAY_MAX_CONTENT_SIZE must be valid UTF-8"),
+    };
     let listener = bind_listener(addr, ingress.as_ref()).await.expect("bind ingress");
     println!("chat-relay listening on {addr}");
     let state = Arc::new(State {
         registry: Mutex::new(Registry::default()),
         auth_token,
+        max_content_size,
     });
     let slots = Arc::new(Semaphore::new(MAX_CONNECTIONS));
     loop {
@@ -667,6 +685,50 @@ async fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn unicode_names_and_content_limits_follow_the_wire_contract() {
+        for name in ["보내는사람", "받는사람_2", "한글", "alice-123", &"가".repeat(32)] {
+            assert!(valid_name(name), "rejected {name}");
+        }
+        for name in ["", "bad name", "bad\nname", "<tag>", &"가".repeat(33)] {
+            assert!(!valid_name(name), "accepted {name}");
+        }
+        assert_eq!(content_size_limit(None), MAX_LINE);
+        assert_eq!(content_size_limit(Some("1048576")), 1048576);
+        for value in ["", "0", "-1", "unlimited", "18446744073709551616"] {
+            assert!(std::panic::catch_unwind(|| content_size_limit(Some(value))).is_err());
+        }
+    }
+
+    #[tokio::test]
+    async fn configured_content_limit_is_enforced_per_frame() {
+        use tokio::io::AsyncWriteExt;
+        let state = Arc::new(State {
+            registry: Mutex::new(Registry::default()),
+            auth_token: None,
+            max_content_size: 128,
+        });
+        let (client, server) = tokio::io::duplex(4096);
+        let task = tokio::spawn(handle(server, "127.0.0.1:1".parse().unwrap(), state));
+        let (reader, mut writer) = tokio::io::split(client);
+        let mut reader = FramedRead::new(reader, LinesCodec::new());
+        writer.write_all("{\"type\":\"register\",\"name\":\"한글\"}\n".as_bytes()).await.unwrap();
+        let welcome: Value = serde_json::from_str(&reader.next().await.unwrap().unwrap()).unwrap();
+        assert_eq!(welcome["type"], "welcome");
+        assert_eq!(welcome["user"], "한글");
+        let _ = reader.next().await;
+        // Multiple bounded frames do not consume a cumulative size allowance.
+        for _ in 0..40 {
+            writer.write_all(b"{\"type\":\"ping\"}\n").await.unwrap();
+            let pong: Value = serde_json::from_str(&reader.next().await.unwrap().unwrap()).unwrap();
+            assert_eq!(pong["type"], "pong");
+        }
+        writer.write_all(&[b'x'; 129]).await.unwrap();
+        writer.write_all(b"\n").await.unwrap();
+        assert!(timeout(Duration::from_secs(1), reader.next()).await.unwrap().is_none());
+        task.await.unwrap();
+    }
 
     #[test]
     fn multiple_vpn_gateway_sources_allow_only_listed_peers() {
