@@ -1,6 +1,6 @@
 //! chat-relay: opaque-payload relay server.
 //!
-//! NDJSON over TCP on loopback, TLS elsewhere. Route payloads without
+//! NDJSON over TCP, with optional TLS. Route payloads without
 //! interpreting their application-level format.
 
 use std::{
@@ -13,7 +13,10 @@ use std::{
         self,
         BufReader,
     },
-    net::{IpAddr, SocketAddr},
+    net::{
+        IpAddr,
+        SocketAddr,
+    },
     sync::{
         Arc,
         Mutex,
@@ -48,8 +51,6 @@ use tokio_rustls::{
     TlsAcceptor,
     rustls,
 };
-#[cfg(target_os = "linux")]
-use tokio::net::TcpSocket;
 use tokio_stream::StreamExt;
 use tokio_util::codec::{
     FramedRead,
@@ -83,13 +84,12 @@ struct TokenRecord {
 
 struct State {
     registry: Mutex<Registry>,
-    auth_token: Option<String>,
     max_content_size: usize,
 }
 
-struct VpnIngress {
-    interface: String,
-    gateways: Option<HashSet<IpAddr>>,
+struct AllowedHost {
+    address: IpAddr,
+    prefix: u32,
 }
 
 fn token() -> String {
@@ -107,27 +107,13 @@ fn valid_name(name: &str) -> bool {
 fn content_size_limit(value: Option<&str>) -> usize {
     match value {
         None => MAX_LINE,
-        Some(value) => value
-            .parse::<usize>()
-            .ok()
-            .filter(|size| *size > 0 && *size <= isize::MAX as usize)
-            .expect("CHAT_RELAY_MAX_CONTENT_SIZE must be a positive byte count"),
-    }
-}
-
-fn bool_env(name: &str, default: bool) -> bool {
-    match std::env::var(name) {
-        Ok(value) if value == "true" => true,
-        Ok(value) if value == "false" => false,
-        Err(std::env::VarError::NotPresent) => default,
-        _ => panic!("{name} must be true or false"),
-    }
-}
-
-fn private_ip(ip: IpAddr) -> bool {
-    match ip {
-        IpAddr::V4(ip) => ip.is_private(),
-        IpAddr::V6(ip) => ip.is_unique_local(),
+        Some(value) => {
+            value
+                .parse::<usize>()
+                .ok()
+                .filter(|size| *size > 0 && *size <= isize::MAX as usize)
+                .expect("CHAT_RELAY_MAX_CONTENT_SIZE must be a positive byte count")
+        }
     }
 }
 
@@ -140,116 +126,46 @@ fn optional_env(name: &str) -> Option<String> {
     }
 }
 
-fn gateway_sources(
-    single: Option<&str>,
-    multiple: Option<&str>,
-    listener: IpAddr,
-) -> Option<HashSet<IpAddr>> {
-    assert!(
-        single.is_none() || multiple.is_none(),
-        "choose one VPN gateway source setting"
-    );
-    let value = single.or(multiple)?;
-    let sources: Vec<_> = if single.is_some() {
-        vec![value]
-    } else {
-        value.split(',').collect()
-    };
-    assert!(
-        !sources.is_empty() && sources.len() <= 16,
-        "VPN gateway source list must contain 1 to 16 IPs"
-    );
-    let mut gateways = HashSet::with_capacity(sources.len());
-    for source in sources {
-        let ip = source
-            .parse::<IpAddr>()
-            .expect("VPN gateway source must be a numeric IP");
-        assert!(
-            ip.is_ipv4() == listener.is_ipv4(),
-            "VPN gateway and listener IP families differ"
-        );
-        assert!(
-            private_ip(listener) && private_ip(ip) && ip != listener,
-            "gateway ingress requires distinct private listener and source IPs"
-        );
-        assert!(gateways.insert(ip), "duplicate VPN gateway source IP");
-    }
-    Some(gateways)
-}
-
-fn peer_allowed(ingress: Option<&VpnIngress>, peer: IpAddr) -> bool {
-    ingress
-        .and_then(|vpn| vpn.gateways.as_ref())
-        .is_none_or(|gateways| gateways.contains(&peer))
-}
-
-fn vpn_ingress(addr: SocketAddr, enabled: bool) -> Option<VpnIngress> {
-    let interface = optional_env("CHAT_RELAY_VPN_INTERFACE");
-    let gateway = optional_env("CHAT_RELAY_VPN_GATEWAY_IP");
-    let gateways = optional_env("CHAT_RELAY_VPN_GATEWAY_IPS");
-    if !enabled {
-        assert!(
-            interface.is_none() && gateway.is_none() && gateways.is_none(),
-            "VPN ingress settings require CHAT_RELAY_VPN_ONLY=true"
-        );
-        return None;
-    }
-    assert!(
-        !addr.ip().is_unspecified() && !addr.ip().is_loopback(),
-        "VPN-only bind must select a non-loopback IP"
-    );
-    let interface = interface.expect("CHAT_RELAY_VPN_INTERFACE required");
-    assert!(
-        !interface.is_empty()
-            && interface.len() <= 15
-            && !interface.starts_with('.')
-            && interface
-                .bytes()
-                .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-' | b'.')),
-        "invalid VPN interface name"
-    );
-    let gateways = gateway_sources(gateway.as_deref(), gateways.as_deref(), addr.ip());
-    Some(VpnIngress {
-        interface,
-        gateways,
-    })
-}
-
-async fn bind_listener(addr: SocketAddr, ingress: Option<&VpnIngress>) -> io::Result<TcpListener> {
-    if let Some(ingress) = ingress {
-        #[cfg(target_os = "linux")]
-        {
-            use std::os::fd::AsRawFd;
-
-            let socket = if addr.is_ipv4() {
-                TcpSocket::new_v4()?
-            } else {
-                TcpSocket::new_v6()?
-            };
-            if ingress.gateways.is_none() {
-                // SIOCGIFHWADDR reads the interface in this socket's network namespace.
-                let mut request: libc::ifreq = unsafe { std::mem::zeroed() };
-                for (target, source) in request.ifr_name.iter_mut().zip(ingress.interface.bytes()) {
-                    *target = source as libc::c_char;
-                }
-                if unsafe { libc::ioctl(socket.as_raw_fd(), libc::SIOCGIFHWADDR, &mut request) } < 0 {
-                    return Err(io::Error::last_os_error());
-                }
-                if unsafe { request.ifr_ifru.ifru_hwaddr.sa_family } != libc::ARPHRD_NONE {
-                    return Err(io::Error::other("direct VPN ingress requires a tunnel interface"));
-                }
+impl AllowedHost {
+    fn matches(&self, peer: IpAddr) -> bool {
+        match (self.address, peer) {
+            (IpAddr::V4(address), IpAddr::V4(peer)) => {
+                let mask = u32::MAX.checked_shl(32 - self.prefix).unwrap_or(0);
+                u32::from(address) & mask == u32::from(peer) & mask
             }
-            socket.bind_device(Some(ingress.interface.as_bytes()))?;
-            socket.bind(addr)?;
-            return socket.listen(1024);
-        }
-        #[cfg(not(target_os = "linux"))]
-        {
-            let _ = ingress;
-            return Err(io::Error::other("VPN ingress requires Linux SO_BINDTODEVICE"));
+            (IpAddr::V6(address), IpAddr::V6(peer)) => {
+                let mask = u128::MAX.checked_shl(128 - self.prefix).unwrap_or(0);
+                u128::from(address) & mask == u128::from(peer) & mask
+            }
+            _ => false,
         }
     }
-    TcpListener::bind(addr).await
+}
+
+async fn allowed_hosts(value: &str) -> io::Result<Vec<AllowedHost>> {
+    let mut hosts = Vec::new();
+    for host in value.split(',').map(str::trim) {
+        if let Some((address, prefix)) = host.split_once('/') {
+            let address: IpAddr = address.parse().map_err(io::Error::other)?;
+            let prefix: u32 = prefix.parse().map_err(io::Error::other)?;
+            if prefix > if address.is_ipv4() { 32 } else { 128 } {
+                return Err(io::Error::other("invalid host CIDR prefix"));
+            }
+            hosts.push(AllowedHost { address, prefix });
+        } else {
+            for address in tokio::net::lookup_host((host, 0)).await? {
+                let address = address.ip();
+                hosts.push(AllowedHost {
+                    address,
+                    prefix: if address.is_ipv4() { 32 } else { 128 },
+                });
+            }
+        }
+    }
+    if hosts.is_empty() {
+        return Err(io::Error::other("allowed hosts resolved to no addresses"));
+    }
+    Ok(hosts)
 }
 
 fn deliver(session: &Session, line: Arc<String>) {
@@ -328,20 +244,10 @@ where
                     }
                     continue;
                 }
-                if let Some(auth_token) = state.auth_token.as_ref()
-                    && !msg
-                        .get("server_token")
-                        .and_then(Value::as_str)
-                        .is_some_and(|t| t.as_bytes().ct_eq(auth_token.as_bytes()).into())
-                {
-                    let _ = reply(&tx, json!({"type": "error", "error": "unauthorized"}));
-                    break;
-                }
                 if !msg.as_object().is_some_and(|fields| {
-                    fields.keys().all(|key| {
-                        matches!(key.as_str(), "type" | "name" | "token")
-                            || (key == "server_token" && state.auth_token.is_some())
-                    })
+                    fields
+                        .keys()
+                        .all(|key| matches!(key.as_str(), "type" | "name" | "token"))
                 }) || msg.get("token").is_some_and(|v| !v.is_string())
                 {
                     if !reply(
@@ -604,64 +510,45 @@ async fn main() {
     if std::fs::exists(".env").expect("inspect .env") {
         dotenvy::from_filename(".env").unwrap_or_else(|_| panic!("invalid .env"));
     }
-    let require_auth_token = bool_env("CHAT_RELAY_REQUIRE_AUTH_TOKEN", true);
-    let allow_unauthenticated_non_loopback =
-        bool_env("CHAT_RELAY_ALLOW_UNAUTHENTICATED_NON_LOOPBACK", false);
-    let auth_token = if require_auth_token {
-        let auth_token =
-            std::env::var("CHAT_RELAY_AUTH_TOKEN").expect("CHAT_RELAY_AUTH_TOKEN required");
-        assert!(
-            auth_token.len() == 64 && auth_token.bytes().all(|b| b.is_ascii_hexdigit()),
-            "CHAT_RELAY_AUTH_TOKEN must be 64 hexadecimal characters"
-        );
-        Some(auth_token)
-    } else {
-        None
-    };
+
     let addr = std::env::args()
         .nth(1)
         .or_else(|| std::env::var("CHAT_RELAY_ADDR").ok())
-        .unwrap_or_else(|| "127.0.0.1:6697".to_string());
+        .unwrap_or_else(|| "0.0.0.0:6697".to_string());
     let addr: SocketAddr = addr.parse().expect("CHAT_RELAY_ADDR must be IP:port");
-    let vpn_only = bool_env("CHAT_RELAY_VPN_ONLY", false);
-    let ingress = vpn_ingress(addr, vpn_only);
-    assert!(
-        require_auth_token || addr.ip().is_loopback() || allow_unauthenticated_non_loopback || vpn_only,
-        "token-free non-loopback bind requires VPN-only ingress or CHAT_RELAY_ALLOW_UNAUTHENTICATED_NON_LOOPBACK=true"
-    );
+    let hosts = match optional_env("CHAT_RELAY_ALLOWED_HOST") {
+        Some(value) => allowed_hosts(&value).await.expect("resolve allowed hosts"),
+        None => Vec::new(),
+    };
     let tls = match (
-        std::env::var("CHAT_RELAY_TLS_CERT"),
-        std::env::var("CHAT_RELAY_TLS_KEY"),
+        optional_env("CHAT_RELAY_TLS_CERT"),
+        optional_env("CHAT_RELAY_TLS_KEY"),
     ) {
-        (Ok(cert), Ok(key)) if !cert.is_empty() && !key.is_empty() => {
+        (Some(cert), Some(key)) => {
             Some(tls_acceptor(&cert, &key).expect("load TLS certificate and key"))
         }
-        (Ok(cert), Ok(key)) if cert.is_empty() && key.is_empty() && addr.ip().is_loopback() => {
-            None
-        }
-        (Err(std::env::VarError::NotPresent), Err(std::env::VarError::NotPresent))
-            if addr.ip().is_loopback() =>
-        {
-            None
-        }
-        _ => panic!("TLS certificate and key required for non-loopback bind"),
+        (None, None) => None,
+        _ => panic!("set both TLS certificate and key paths"),
     };
     let max_content_size = match std::env::var("CHAT_RELAY_MAX_CONTENT_SIZE") {
         Ok(value) => content_size_limit(Some(&value)),
         Err(std::env::VarError::NotPresent) => content_size_limit(None),
         Err(_) => panic!("CHAT_RELAY_MAX_CONTENT_SIZE must be valid UTF-8"),
     };
-    let listener = bind_listener(addr, ingress.as_ref()).await.expect("bind ingress");
+    let listener = TcpListener::bind(addr).await.expect("bind");
     println!("chat-relay listening on {addr}");
     let state = Arc::new(State {
         registry: Mutex::new(Registry::default()),
-        auth_token,
         max_content_size,
     });
     let slots = Arc::new(Semaphore::new(MAX_CONNECTIONS));
     loop {
         let (sock, peer) = listener.accept().await.expect("accept");
-        if !peer_allowed(ingress.as_ref(), peer.ip()) {
+        if !hosts.is_empty()
+            && !hosts
+                .iter()
+                .any(|host| host.matches(peer.ip().to_canonical()))
+        {
             continue;
         }
         let Ok(permit) = slots.clone().try_acquire_owned() else {
@@ -688,7 +575,13 @@ mod tests {
 
     #[test]
     fn unicode_names_and_content_limits_follow_the_wire_contract() {
-        for name in ["보내는사람", "받는사람_2", "한글", "alice-123", &"가".repeat(32)] {
+        for name in [
+            "보내는사람",
+            "받는사람_2",
+            "한글",
+            "alice-123",
+            &"가".repeat(32),
+        ] {
             assert!(valid_name(name), "rejected {name}");
         }
         for name in ["", "bad name", "bad\nname", "<tag>", &"가".repeat(33)] {
@@ -706,14 +599,16 @@ mod tests {
         use tokio::io::AsyncWriteExt;
         let state = Arc::new(State {
             registry: Mutex::new(Registry::default()),
-            auth_token: None,
             max_content_size: 128,
         });
         let (client, server) = tokio::io::duplex(4096);
         let task = tokio::spawn(handle(server, "127.0.0.1:1".parse().unwrap(), state));
         let (reader, mut writer) = tokio::io::split(client);
         let mut reader = FramedRead::new(reader, LinesCodec::new());
-        writer.write_all("{\"type\":\"register\",\"name\":\"한글\"}\n".as_bytes()).await.unwrap();
+        writer
+            .write_all("{\"type\":\"register\",\"name\":\"한글\"}\n".as_bytes())
+            .await
+            .unwrap();
         let welcome: Value = serde_json::from_str(&reader.next().await.unwrap().unwrap()).unwrap();
         assert_eq!(welcome["type"], "welcome");
         assert_eq!(welcome["user"], "한글");
@@ -726,62 +621,53 @@ mod tests {
         }
         writer.write_all(&[b'x'; 129]).await.unwrap();
         writer.write_all(b"\n").await.unwrap();
-        assert!(timeout(Duration::from_secs(1), reader.next()).await.unwrap().is_none());
+        assert!(
+            timeout(Duration::from_secs(1), reader.next())
+                .await
+                .unwrap()
+                .is_none()
+        );
         task.await.unwrap();
     }
 
-    #[test]
-    fn multiple_vpn_gateway_sources_allow_only_listed_peers() {
-        let listener = "172.24.0.10".parse().unwrap();
-        let gateways = gateway_sources(None, Some("172.24.0.2,172.24.0.3"), listener).unwrap();
-        let ingress = VpnIngress {
-            interface: "eth0".into(),
-            gateways: Some(gateways),
-        };
-        assert!(peer_allowed(Some(&ingress), "172.24.0.2".parse().unwrap()));
-        assert!(peer_allowed(Some(&ingress), "172.24.0.3".parse().unwrap()));
-        assert!(!peer_allowed(Some(&ingress), "172.24.0.4".parse().unwrap()));
-        assert!(!peer_allowed(Some(&ingress), "172.24.0.1".parse().unwrap()));
-        assert!(peer_allowed(None, "172.24.0.4".parse().unwrap()));
-        assert_eq!(
-            gateway_sources(Some("172.24.0.2"), None, listener).unwrap(),
-            HashSet::from(["172.24.0.2".parse().unwrap()])
-        );
-    }
-
-    #[test]
-    fn gateway_sources_reject_ambiguous_or_broad_admission() {
-        let listener = "172.24.0.10".parse().unwrap();
-        for (single, multiple) in [
-            (Some("172.24.0.2"), Some("172.24.0.3")),
-            (None, Some("")),
-            (None, Some("172.24.0.2,")),
-            (None, Some("172.24.0.2,172.24.0.2")),
-            (None, Some("0.0.0.0")),
-            (None, Some("172.24.0.10")),
-            (None, Some("172.24.0.0/24")),
-            (None, Some("chat-engine")),
-            (None, Some("8.8.8.8")),
-            (None, Some("fd00::2")),
+    #[tokio::test]
+    async fn host_filter_accepts_addresses_names_and_networks() {
+        let hosts = allowed_hosts("127.0.0.1, localhost,192.168.0.0/24,fd00::/64")
+            .await
+            .unwrap();
+        for (peer, expected) in [
+            ("127.0.0.1", true),
+            ("::1", true),
+            ("127.0.0.2", false),
+            ("192.168.0.0", true),
+            ("192.168.0.255", true),
+            ("192.168.1.0", false),
+            ("fd00::123", true),
+            ("fd00:0:0:1::1", false),
         ] {
-            assert!(
-                std::panic::catch_unwind(|| gateway_sources(single, multiple, listener)).is_err(),
-                "accepted gateway sources {single:?} {multiple:?}"
+            assert_eq!(
+                hosts.iter().any(|host| host.matches(peer.parse().unwrap())),
+                expected,
+                "{peer}"
             );
         }
-        let too_many = (1..=17)
-            .map(|last| format!("172.24.1.{last}"))
-            .collect::<Vec<_>>()
-            .join(",");
-        assert!(
-            std::panic::catch_unwind(|| gateway_sources(None, Some(&too_many), listener)).is_err()
-        );
-        assert_eq!(
-            gateway_sources(None, Some("fd12::2,fd12::3"), "fd12::10".parse().unwrap())
-                .unwrap()
-                .len(),
-            2
-        );
+        for value in [
+            "192.168.0.0/33",
+            "fd00::/129",
+            "127.0.0.1,",
+            "",
+            "bad/network",
+        ] {
+            assert!(allowed_hosts(value).await.is_err(), "{value}");
+        }
+        for (network, peer) in [
+            ("0.0.0.0/0", "8.8.8.8"),
+            ("::/0", "2001:db8::1"),
+            ("192.168.0.1/32", "192.168.0.1"),
+            ("::1/128", "::1"),
+        ] {
+            assert!(allowed_hosts(network).await.unwrap()[0].matches(peer.parse().unwrap()));
+        }
     }
 
     #[test]

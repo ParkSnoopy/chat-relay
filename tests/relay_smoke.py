@@ -1,31 +1,32 @@
-"""Smoke test for a running relay in either token admission mode.
+"""Smoke test for a running relay with optional TLS and host filtering.
 
 Set TEST_RELAY_HOST, TEST_RELAY_PORT and TEST_RELAY_TLS_CERT for a TLS listener.
 Set TEST_RELAY_SOURCE_IPS to exercise several allowed source IPs, and
-TEST_RELAY_DENIED_SOURCE_IP to check rejection before TLS.
+TEST_RELAY_DENIED_SOURCE_IP to check host rejection.
 """
 import itertools, json, select, socket, ssl, threading, time, os
 
 ADDR = (os.environ.get("TEST_RELAY_HOST", "127.0.0.1"), int(os.environ.get("TEST_RELAY_PORT", "6697")))
-AUTH_REQUIRED = os.environ.get("TEST_RELAY_AUTH_REQUIRED", "true") == "true"
-SERVER_TOKEN = os.environ["CHAT_RELAY_AUTH_TOKEN"] if AUTH_REQUIRED else None
+
 TLS_CERT = os.environ.get("TEST_RELAY_TLS_CERT")
 SOURCES = os.environ.get("TEST_RELAY_SOURCE_IPS", "")
 SOURCE_CYCLE = itertools.cycle(SOURCES.split(",")) if SOURCES else None
 
 if os.environ.get("TEST_RELAY_DENIED_SOURCE_IP"):
-    assert TLS_CERT, "denied-source check requires TEST_RELAY_TLS_CERT"
     denied = socket.socket()
     denied.settimeout(1)
+    denied.bind((os.environ["TEST_RELAY_DENIED_SOURCE_IP"], 0))
+    denied.connect(ADDR)
     try:
-        denied.bind((os.environ["TEST_RELAY_DENIED_SOURCE_IP"], 0))
-        denied.connect(ADDR)
-        ssl.create_default_context(cafile=TLS_CERT).wrap_socket(denied, server_hostname="localhost")
-        raise AssertionError("untrusted source completed TLS handshake")
+        denied.sendall(b'{"type":"register","name":"denied"}\n')
+        assert denied.recv(1) == b"", "denied host received a response"
+    except socket.timeout:
+        raise AssertionError("denied host was not closed")
     except OSError:
-        print("PASS untrusted source rejected before TLS")
+        pass
     finally:
         denied.close()
+    print("PASS denied host closed")
 
 class Client:
     def __init__(self):
@@ -87,8 +88,6 @@ class Client:
 
     def register(self, name, token=None):
         msg = {"type": "register", "name": name}
-        if AUTH_REQUIRED:
-            msg["server_token"] = SERVER_TOKEN
         if token is not None:
             msg["token"] = token
         self.send(msg)
@@ -134,11 +133,7 @@ check("dup name rejected", eve.wait_for(lambda m: m.get("type") == "error" and m
 
 unauthorized = Client()
 unauthorized.send({"type": "register", "name": "mallory", "server_token": "wrong"})
-check("token handling matches admission mode", unauthorized.wait_for(lambda m: m.get("error") == ("unauthorized" if AUTH_REQUIRED else "invalid registration")))
-if AUTH_REQUIRED:
-    missing = Client()
-    missing.send({"type": "register", "name": "mallory"})
-    check("missing admission token rejected", missing.wait_for(lambda m: m.get("error") == "unauthorized"))
+check("obsolete server token rejected", unauthorized.wait_for(lambda m: m.get("error") == "invalid registration"))
 invalid = Client()
 invalid.register("fake\nlog")
 check("unsafe name rejected", invalid.wait_for(lambda m: m.get("error") == "invalid name"))

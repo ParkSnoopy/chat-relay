@@ -11,50 +11,26 @@ the linked files at the end are optional references.
 
 ## Run it
 
-Build/run with a Rust toolchain supporting edition 2024. By default set
-`CHAT_RELAY_AUTH_TOKEN` in the process environment to a **64-character
-hexadecimal** server admission secret before starting. The server refuses to
-start without it unless `CHAT_RELAY_REQUIRE_AUTH_TOKEN=false`. On the local machine:
+Build/run with a Rust toolchain supporting edition 2024. On the local machine:
 
 ```sh
 cargo run --locked -- 127.0.0.1:6697
 ```
 
 The command-line address takes precedence over `CHAT_RELAY_ADDR`; otherwise
-the default is `127.0.0.1:6697`. Addresses must be numeric IP:port values,
+the default is `0.0.0.0:6697`. Addresses must be numeric IP:port values,
 not hostnames. The server optionally loads `.env` from its working directory;
 pre-existing process environment variables take precedence. The example
-configuration is [`.env.example`](./.env.example), with its admission secret
-intentionally unset. Set both TLS paths to readable PEM files to enable TLS;
-leave both empty for plaintext on loopback only. A
-non-loopback bind requires both `CHAT_RELAY_TLS_CERT` and
-`CHAT_RELAY_TLS_KEY`, pointing to readable PEM certificate-chain and private-key
-files; peers must verify the certificate against the server name. Both TLS
-settings may also be supplied on a loopback bind. Failed configuration or bind
-exits rather than falling back to an insecure listener.
+configuration is [`.env.example`](./.env.example).
+`CHAT_RELAY_ALLOWED_HOST` accepts comma-separated source IPs, hostnames, and
+IPv4/IPv6 CIDRs. Hostnames resolve once at startup; matching uses the TCP peer
+IP, not reverse DNS or a client-supplied name. Unset or empty means all hosts
+are allowed. Invalid entries fail startup. No interface or VPN policy is enforced;
+network isolation and security are the deployer's responsibility.
+TLS is optional on every bind. Both paths enable TLS; both empty or absent
+select plaintext. Supplying only one path fails startup.
 
-Token admission is enabled by default. With `CHAT_RELAY_REQUIRE_AUTH_TOKEN=false`,
-registrations omit `server_token`; the server ignores `CHAT_RELAY_AUTH_TOKEN`
-even if present in the environment. A token-free non-loopback bind also requires
-either `CHAT_RELAY_VPN_ONLY=true` plus `CHAT_RELAY_VPN_INTERFACE`, or the
-explicitly unsafe override `CHAT_RELAY_ALLOW_UNAUTHENTICATED_NON_LOOPBACK=true`.
-VPN-only mode binds a specific non-loopback IP to the named Linux interface;
-direct mode requires a tunnel interface. For a separate VPN gateway, set
-`CHAT_RELAY_VPN_GATEWAY_IP` to its exact private source IP and choose a private
-listener IP on the selected private ingress. For several VPN engine containers,
-set `CHAT_RELAY_VPN_GATEWAY_IPS` to their comma-separated exact private source
-IPs instead; do not set both variables. The list accepts 1–16 unique numeric
-private IPs of the listener's address family, not DNS names, Docker container
-names, CIDRs or wildcard sources. Container names can resolve to changed IPs
-after replacement; inspect the owned containers and update the list before
-restarting the relay. Each engine must reject off-VPN traffic before reaching
-this ingress; the relay cannot inspect upstream VPN policy.
-The unsafe override alone provides **no** VPN isolation. Boolean flags accept
-only lowercase `true` or `false`; invalid values fail startup.
-
-To check a running loopback relay, run the repository smoke test in another
-terminal with the **same** `CHAT_RELAY_AUTH_TOKEN` in that terminal's
-environment when admission is enabled:
+To check a running relay, run the repository smoke test in another terminal:
 
 ```sh
 python3 tests/relay_smoke.py
@@ -63,19 +39,15 @@ python3 tests/relay_smoke.py
 The server's `.env` is not loaded by the Python test. For a test TLS listener,
 set `TEST_RELAY_HOST` and `TEST_RELAY_PORT` to its address and port, and
 `TEST_RELAY_TLS_CERT` to the certificate trusted by the test; it verifies
-`localhost`. For token-free mode set `TEST_RELAY_AUTH_REQUIRED=false` in the
-test environment.
+`localhost`.
 
 The [Dockerfile](./Dockerfile) builds `linux/amd64` in the publication workflow
 and starts the binary as UID/GID 65532. Build locally with
 `docker build -t chat-relay:local .`. In a container, set
 `CHAT_RELAY_ADDR=0.0.0.0:6697` (loopback inside the container is unreachable
-through a published port), provide the admission token unless disabled and both
-TLS file paths as environment variables, mount those files readably for UID
-65532, and publish TCP port 6697 only for deployments that intentionally expose
-it. TLS is mandatory on this container bind.
-For VPN-only mode, the selected interface must exist inside the container's
-network namespace; do not expose its listener through a public Docker port.
+through a published port). Host filtering sees the source IP delivered by the
+container network. When using TLS, mount its files readably for UID 65532.
+Port exposure and network protection are deployment decisions.
 The [publication workflow](./.github/workflows/publish-container.yml) pushes
 `ghcr.io/<lowercase-owner>/<lowercase-repo>` for pushed `v*` SemVer tags,
 with version and major.minor tags; it does not publish `latest`.
@@ -95,19 +67,17 @@ all queued messages. Server logs contain addresses and names, not payloads.
 
 ## Wire contract
 
-Open one TCP connection (TLS for non-loopback), send one JSON object per line,
+Open one TCP connection (TLS when configured), send one JSON object per line,
 and read events on the same connection. A complete line is required for each
 request. The first operation is registration:
 
 ```json
-{"type":"register","name":"alice","server_token":"<server-admission-token>"}
+{"type":"register","name":"alice"}
 ```
 
-Names are 1–32 bytes of ASCII letters, digits, `_` or `-`. Successful
+Names are 1–32 Unicode alphanumeric characters, `_` or `-`. Successful
 registration sends `{"type":"welcome","user":"alice","token":"..."}`.
-When admission is disabled, omit `server_token` from registration entirely.
-Otherwise it admits a peer to this server; the returned per-name `token`
-is a different, 128-bit secret for reclaiming that name. Retain the newest
+The returned per-name `token` is a 128-bit secret for reclaiming that name. Retain the newest
 returned token if reclaim is needed. A peer already holding a reclaim token
 registers with the same fields plus `"token":"<newest-name-token>"`.
 Reclaim rotates the name token and closes its previous connection, including
@@ -162,15 +132,16 @@ respectively. A directed message to a missing recipient returns
 `user unavailable` and is not queued for later. `register first` applies to
 messages and `users` sent before registration. A repeated registration
 returns `already registered`; unrecognized requests return `unknown type`.
-Missing or wrong server admission when enabled yields `unauthorized` and closes
-the connection. A `server_token` field in token-free mode is invalid registration.
+Only `type`, `name`, and optional `token` belong in registration.
 Other invalid requests normally leave the connection open; EOF, timeouts,
 oversized lines, and slow readers close it. Delivery after a disconnected
 send is unknown: a sender echo does not confirm recipient receipt, and the
 protocol has no automatic retry.
 
-One NDJSON line is limited to 256 KiB; callers must split larger payloads
-into independently routable messages. An unregistered connection has 10
+`CHAT_RELAY_MAX_CONTENT_SIZE` limits incoming NDJSON lines in bytes excluding
+the newline (default 256 KiB). It is not a total file or transfer limit;
+callers split larger payloads into independently routable messages.
+An unregistered connection has 10
 seconds to send a complete line; a registered connection is idle-closed after
 5 minutes without a complete line (send `ping` if needed). TLS handshakes and
 blocked writes time out after 10 seconds. At most 64 connections are admitted;
